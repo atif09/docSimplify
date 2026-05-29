@@ -21,7 +21,11 @@ app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 
 // Path to file-based persistent history database
-const HISTORY_FILE_PATH = path.join(process.cwd(), "user_history.json");
+const isVercel = !!process.env.VERCEL;
+const BUNDLED_DB_PATH = path.join(process.cwd(), "user_history.json");
+const HISTORY_FILE_PATH = isVercel 
+  ? path.join("/tmp", "user_history.json") 
+  : BUNDLED_DB_PATH;
 
 // Default initial database structure
 interface UserData {
@@ -29,6 +33,8 @@ interface UserData {
   history: any[];
   saved: any[];
   displayName?: string;
+  phoneNumber?: string;
+  registered?: boolean;
 }
 
 interface DbStructure {
@@ -48,8 +54,8 @@ const DEFAULT_DB: DbStructure = {
   history: [],
   saved: [],
   userProfile: {
-    email: "likhithachettipally@gmail.com",
-    displayName: "Likhith Chettipally"
+    email: "citizen@gov.in",
+    displayName: "Citizen User"
   }
 };
 
@@ -58,6 +64,15 @@ function loadDb(): DbStructure {
   try {
     if (fs.existsSync(HISTORY_FILE_PATH)) {
       const raw = fs.readFileSync(HISTORY_FILE_PATH, "utf-8");
+      return JSON.parse(raw);
+    } else if (isVercel && fs.existsSync(BUNDLED_DB_PATH)) {
+      // In Vercel, copy the bundled DB to /tmp on first read to avoid EROFS and pre-populate accounts
+      const raw = fs.readFileSync(BUNDLED_DB_PATH, "utf-8");
+      try {
+        fs.writeFileSync(HISTORY_FILE_PATH, raw, "utf-8");
+      } catch (writeErr) {
+        console.error("Failed to copy bundled db to /tmp", writeErr);
+      }
       return JSON.parse(raw);
     }
   } catch (err) {
@@ -68,7 +83,7 @@ function loadDb(): DbStructure {
 
 // Helper to retrieve or create user-specific session container securely
 function getUserData(db: any, email: string): UserData {
-  const normEmail = (email || "likhithachettipally@gmail.com").trim().toLowerCase();
+  const normEmail = (email || "citizen@gov.in").trim().toLowerCase();
   
   if (!db.users) {
     db.users = {};
@@ -76,7 +91,7 @@ function getUserData(db: any, email: string): UserData {
   
   // Backward compatibility migration: If legacy fields exist and show records, migrate them to their proper email bucket
   if (db.history && db.history.length > 0) {
-    const legacyEmail = (db.userProfile?.email || "likhithachettipally@gmail.com").trim().toLowerCase();
+    const legacyEmail = (db.userProfile?.email || "citizen@gov.in").trim().toLowerCase();
     if (!db.users[legacyEmail]) {
       db.users[legacyEmail] = {
         trustScore: db.trustScore !== undefined ? db.trustScore : 85,
@@ -130,7 +145,7 @@ function getGeminiClient(): GoogleGenAI {
 
 // Robust fallback wrapper with Exponential Backoff for 503 errors and Model fallbacks
 async function generateContentWithFallback(ai: GoogleGenAI, params: { contents: any; config: any }) {
-  const models = ["gemini-3.5-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
+  const models = ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"];
   let lastError: any = null;
 
   for (const modelName of models) {
@@ -191,25 +206,28 @@ if (!fs.existsSync(HISTORY_FILE_PATH)) {
 
 // 1. Get User Profile & trust score
 app.get("/api/profile", (req, res) => {
-  const email = (req.headers["x-user-email"] as string) || "likhithachettipally@gmail.com";
+  const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
   const db = loadDb();
   const userData = getUserData(db, email);
   res.json({
     email: email,
-    displayName: userData.displayName || db.userProfile?.displayName || "Likhith Chettipally",
+    displayName: userData.displayName || db.userProfile?.displayName || "Citizen User",
     trustScore: userData.trustScore
   });
 });
 
 // Update profile preferences
 app.post("/api/profile/update", (req, res) => {
-  const { displayName, email } = req.body;
+  const { displayName, email, phoneNumber } = req.body;
   const db = loadDb();
   if (email) {
     const normEmail = email.toLowerCase();
     const userData = getUserData(db, normEmail);
     if (displayName) {
       userData.displayName = displayName;
+    }
+    if (phoneNumber) {
+      userData.phoneNumber = phoneNumber;
     }
     if (!db.userProfile) db.userProfile = { email: "", displayName: "" };
     db.userProfile.email = email;
@@ -222,9 +240,123 @@ app.post("/api/profile/update", (req, res) => {
   res.json({ status: "success", profile: db.userProfile });
 });
 
+// Explicit registration endpoint: saves the user with verified status
+app.post("/api/register", (req, res) => {
+  const { displayName, email, phoneNumber } = req.body;
+  if (!email) {
+    return res.status(400).json({ error: "Email is required for registration" });
+  }
+  const db = loadDb();
+  const normEmail = email.trim().toLowerCase();
+  
+  if (!db.users) {
+    db.users = {};
+  }
+  
+  db.users[normEmail] = {
+    trustScore: 85,
+    history: [],
+    saved: [],
+    displayName: displayName || "John Doe",
+    phoneNumber: phoneNumber || "",
+    registered: true
+  };
+  
+  saveDb(db);
+  res.json({ 
+    status: "success", 
+    profile: {
+      email: normEmail,
+      displayName: db.users[normEmail].displayName,
+      trustScore: 85,
+      isLoggedIn: true
+    }
+  });
+});
+
+// Lookup email by phone number
+app.post("/api/lookup-phone", (req, res) => {
+  const { phoneNumber } = req.body;
+  if (!phoneNumber) {
+    return res.status(400).json({ error: "Phone number is required." });
+  }
+  
+  const db = loadDb();
+  const cleanPhone = phoneNumber.trim().replace(/\s+/g, "").replace(/\+/g, "");
+  
+  if (!db.users) {
+    return res.status(404).json({ error: "No users registered yet." });
+  }
+  
+  // Find in local memory database
+  const email = Object.keys(db.users).find(e => {
+    const userPhone = db.users[e].phoneNumber || "";
+    if (!userPhone) return false;
+    
+    const uDigits = userPhone.replace(/\D/g, "");
+    const qDigits = phoneNumber.trim().replace(/\D/g, "");
+    if (!uDigits || !qDigits) return false;
+    
+    if (uDigits === qDigits) return true;
+    
+    const u10 = uDigits.length >= 10 ? uDigits.slice(-10) : uDigits;
+    const q10 = qDigits.length >= 10 ? qDigits.slice(-10) : qDigits;
+    
+    return u10 === q10;
+  });
+
+  if (email) {
+    return res.json({ email: email.toLowerCase() });
+  }
+
+  res.status(404).json({ error: "This phone number is not registered. Please select the 'New Citizen? Register' link below first." });
+});
+
+// Explicit login validation: ensures users are registered/initialized in the National Portal database
+app.post("/api/login", (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).json({ error: "Email is required for login check." });
+  }
+  const db = loadDb();
+  const normEmail = email.trim().toLowerCase();
+  
+  if (!db.users) {
+    db.users = {};
+  }
+  
+  // If the user database document does not exist yet for this email, auto-initialize it safely
+  if (!db.users[normEmail] || !db.users[normEmail].registered) {
+    const computedName = normEmail.split("@")[0].split(/[._+-]/)
+      .map(p => p.charAt(0).toUpperCase() + p.slice(1))
+      .join(" ") || "Citizen User";
+      
+    db.users[normEmail] = {
+      trustScore: 85,
+      history: [],
+      saved: [],
+      displayName: computedName,
+      phoneNumber: "",
+      registered: true
+    };
+    saveDb(db);
+  }
+  
+  const userData = db.users[normEmail];
+  res.json({
+    status: "success",
+    profile: {
+      email: normEmail,
+      displayName: userData.displayName || "John Doe",
+      trustScore: userData.trustScore || 85,
+      isLoggedIn: true
+    }
+  });
+});
+
 // 2. Fetch recent document history
 app.get("/api/history", (req, res) => {
-  const email = (req.headers["x-user-email"] as string) || "likhithachettipally@gmail.com";
+  const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
   const db = loadDb();
   const userData = getUserData(db, email);
   res.json({
@@ -236,7 +368,7 @@ app.get("/api/history", (req, res) => {
 
 // 3. Mark/unmark a result as saved
 app.post("/api/save", (req, res) => {
-  const email = (req.headers["x-user-email"] as string) || "likhithachettipally@gmail.com";
+  const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
   const { documentId, saveState } = req.body;
   const db = loadDb();
   const userData = getUserData(db, email);
@@ -260,7 +392,7 @@ app.post("/api/save", (req, res) => {
 
 // Delete a document from history
 app.delete("/api/history/:id", (req, res) => {
-  const email = (req.headers["x-user-email"] as string) || "likhithachettipally@gmail.com";
+  const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
   const { id } = req.params;
   const db = loadDb();
   const userData = getUserData(db, email);
@@ -272,7 +404,7 @@ app.delete("/api/history/:id", (req, res) => {
 
 // Clear entire history
 app.post("/api/history/clear", (req, res) => {
-  const email = (req.headers["x-user-email"] as string) || "likhithachettipally@gmail.com";
+  const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
   const db = loadDb();
   const userData = getUserData(db, email);
   userData.history = [];
@@ -284,7 +416,7 @@ app.post("/api/history/clear", (req, res) => {
 
 // 4. Document processing (Manual Paste Text or PDF/Image Base64 extraction)
 app.post("/api/process", async (req, res) => {
-  const email = (req.headers["x-user-email"] as string) || "likhithachettipally@gmail.com";
+  const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
   const { text, fileData, fileName, mimeType, sourceLang } = req.body;
 
   if (!text && !fileData) {
@@ -455,4 +587,9 @@ async function startServer() {
   });
 }
 
-startServer();
+// Only start the standalone HTTP server if we are NOT running inside Vercel's Serverless Function environment
+if (!process.env.VERCEL) {
+  startServer();
+}
+
+export default app;

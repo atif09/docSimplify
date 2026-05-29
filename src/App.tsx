@@ -175,17 +175,6 @@ export default function App() {
     }
   }, [complexityMode, selectedLang]);
 
-  // Clean stale displayed names (e.g., if still stuck on 'Citizen User' for specific emails)
-  useEffect(() => {
-    if (user && user.email) {
-      if (user.displayName === "Citizen User" && user.email.toLowerCase() === "likhithachettipally@gmail.com") {
-        const updatedUser = { ...user, displayName: "Likhith Chettipally" };
-        setUser(updatedUser);
-        localStorage.setItem("docuease_user", JSON.stringify(updatedUser));
-      }
-    }
-  }, [user]);
-
   // Handle Drag Events
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault();
