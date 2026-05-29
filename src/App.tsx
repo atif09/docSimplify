@@ -367,7 +367,20 @@ export default function App() {
       if (!response.ok) {
         let errMsg = "Platform gateway dropped connection.";
         try {
-          const errData = await response.json();
+          const responseText = await response.text();
+
+console.log("RAW ERROR RESPONSE:", responseText);
+
+let errData = {};
+
+try {
+  errData = responseText ? JSON.parse(responseText) : {};
+} catch (error) {
+  console.error("JSON Parse Failed:", error);
+  errData = {
+    message: responseText
+  };
+}
           errMsg = errData.error || errMsg;
         } catch (jsonErr) {
           try {
