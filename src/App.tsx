@@ -214,10 +214,12 @@ export default function App() {
 
   const processFile = (file: File) => {
     const isTextFile = file.type === "text/plain" || file.name.endsWith(".txt");
-    const reader = new FileReader();
+    const isImageFile = file.type.startsWith("image/");
+    setErrorMsg("");
 
-    reader.onload = () => {
-      if (isTextFile) {
+    if (isTextFile) {
+      const reader = new FileReader();
+      reader.onload = () => {
         const textContent = reader.result as string;
         setInputText(textContent);
         setFileDetails({
@@ -226,9 +228,68 @@ export default function App() {
           type: "text/plain",
           base64: null
         });
-      } else {
+      };
+      reader.readAsText(file);
+    } else if (isImageFile) {
+      // Compress image client-side to keep under 4MB limit, prevent payload too large & speed up upload
+      const img = new Image();
+      img.src = URL.createObjectURL(file);
+      img.onload = () => {
+        URL.revokeObjectURL(img.src);
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          setErrorMsg("Failed to initialize canvas for image compression.");
+          return;
+        }
+
+        const MAX_DIM = 1600;
+        let width = img.width;
+        let height = img.height;
+
+        if (width > MAX_DIM || height > MAX_DIM) {
+          if (width > height) {
+            height = Math.round((height * MAX_DIM) / width);
+            width = MAX_DIM;
+          } else {
+            width = Math.round((width * MAX_DIM) / height);
+            height = MAX_DIM;
+          }
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        ctx.drawImage(img, 0, 0, width, height);
+
+        // Convert and compress to JPEG with 0.75 quality for dramatic size minimization
+        const compressedBase64 = canvas.toDataURL("image/jpeg", 0.75);
+        const base64Clean = compressedBase64.split(",")[1];
+
+        const estimatedBytes = Math.round((base64Clean.length * 3) / 4);
+        const sizeStr = (estimatedBytes / 1024 / 1024).toFixed(2) + " MB";
+
+        setFileDetails({
+          name: file.name,
+          size: sizeStr,
+          type: "image/jpeg",
+          base64: base64Clean
+        });
+        setInputText(`[UPLOADED FILE DETECTED: ${file.name}] Ready for simplified digital auditing.`);
+      };
+      img.onerror = () => {
+        setErrorMsg("Failed to process the uploaded image file. Please verify it is a valid format.");
+      };
+    } else {
+      // PDF or other binaries
+      if (file.size > 4 * 1024 * 1024) {
+        setErrorMsg("Uploaded PDF document is too large. For secure billing, PDF files must be under 4MB.");
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = () => {
         const base64Result = reader.result as string;
-        const base64Clean = base64Result.split(",")[1]; // remove prefix metadata
+        const base64Clean = base64Result.split(",")[1];
         setFileDetails({
           name: file.name,
           size: (file.size / 1024 / 1024).toFixed(2) + " MB",
@@ -236,12 +297,7 @@ export default function App() {
           base64: base64Clean
         });
         setInputText(`[UPLOADED FILE DETECTED: ${file.name}] Ready for simplified digital auditing.`);
-      }
-    };
-
-    if (isTextFile) {
-      reader.readAsText(file);
-    } else {
+      };
       reader.readAsDataURL(file);
     }
   };
@@ -309,11 +365,31 @@ export default function App() {
       clearInterval(progressInterval);
 
       if (!response.ok) {
-        const errData = await response.json();
-        throw new Error(errData.error || "Platform gateway dropped connection.");
+        let errMsg = "Platform gateway dropped connection.";
+        try {
+          const errData = await response.json();
+          errMsg = errData.error || errMsg;
+        } catch (jsonErr) {
+          try {
+            const rawText = await response.text();
+            if (rawText && rawText.length < 300) {
+              errMsg = rawText;
+            } else {
+              errMsg = `Server gateway returned status ${response.status}. Please make sure your file is valid and under 4MB.`;
+            }
+          } catch (textErr) {
+            errMsg = `Server gateway returned status ${response.status}.`;
+          }
+        }
+        throw new Error(errMsg);
       }
 
-      const payload = await response.json();
+      let payload: any;
+      try {
+        payload = await response.json();
+      } catch (jsonParseErr) {
+        throw new Error("Received an invalid response from the gateway. Please try again with a cleaner document input.");
+      }
       setCurrentResult(payload.result);
       if (payload.trustScore) {
         setPortalTrustScore(payload.trustScore);
