@@ -1,3 +1,14 @@
-import app from "../server.ts";
+import express from "express";
+
+const app = express();
+
+app.use(express.json());
+
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    message: "API working"
+  });
+});
 
 export default app;
