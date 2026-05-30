@@ -44,7 +44,7 @@ if (!admin.apps.length) {
     console.error("[Firebase Initialization Warning]: Continuing in local fallback mode.", err);
   }
 }
-}
+
 
 // Instance reference to Firestore database
 const db = admin.apps.length ? admin.firestore() : null;
