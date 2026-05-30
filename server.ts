@@ -5,26 +5,47 @@
 
 import express from "express";
 import path from "path";
+import fs from "fs";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import * as admin from "firebase-admin";
+import { fileURLToPath } from "url";
 
 // Load environment variables
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+
+// Handle __dirname for ESM context - use try/catch for compatibility
+let __dirname: string;
+try {
+  __dirname = path.dirname(fileURLToPath(import.meta.url));
+} catch (e) {
+  __dirname = process.cwd();
+}
 
 // Set up body parsing limits to handle base64 documents (PDF/images)
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
+
+// Serve static files from dist directory (Vite build output)
+const distPath = path.resolve(__dirname, "dist");
+const indexHtmlPath = path.join(distPath, "index.html");
+
+// Check if dist/index.html exists, if not we're in dev mode without a build
+const isDevelopmentMode = !fs.existsSync(indexHtmlPath);
+
+if (!isDevelopmentMode) {
+  app.use(express.static(distPath, { maxAge: "1h" }));
+}
 
 // In-Memory structural runtime fallback database to keep app alive if Firebase Credentials error out
 let fallbackMemoryDb: Record<string, any> = {};
 
 // Initialize Firebase Admin SDK with safe fallback boundaries
 let isFirebaseConnected = false;
-if (!admin.apps.length) {
+if (!admin.apps || admin.apps.length === 0) {
   try {
     const serviceAccountStr = process.env.FIREBASE_SERVICE_ACCOUNT;
     if (serviceAccountStr) {
@@ -51,7 +72,7 @@ if (!admin.apps.length) {
   isFirebaseConnected = true;
 }
 
-const db = isFirebaseConnected && admin.apps.length ? admin.firestore() : null;
+const db = isFirebaseConnected && admin.apps && admin.apps.length > 0 ? admin.firestore() : null;
 
 interface UserData {
   trustScore: number;
@@ -123,9 +144,13 @@ async function saveUserFirestoreData(email: string, data: UserData): Promise<voi
 let geminiClient: GoogleGenAI | null = null;
 function getGeminiClient(): GoogleGenAI {
   if (!geminiClient) {
-    const key = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
+    // Try multiple sources for the API key (supports both local .env and Vercel env vars)
+    const key = process.env.GEMINI_API_KEY || 
+                process.env.VITE_GEMINI_API_KEY ||
+                (typeof window !== "undefined" && (window as any).__VITE_GEMINI_API_KEY);
+    
     if (!key || key === "MY_GEMINI_API_KEY") {
-      throw new Error("Generative engine key missing or unassigned in cloud profile settings.");
+      throw new Error("Generative engine key missing or unassigned in cloud profile settings. Set GEMINI_API_KEY environment variable.");
     }
     geminiClient = new GoogleGenAI({
       apiKey: key,
@@ -397,4 +422,64 @@ Process lightning fast. No long paragraphs.
   }
 });
 
+// SPA Catch-all route - serve index.html for all non-API routes
+app.get("*", (req, res) => {
+  const indexPath = path.resolve(distPath, "index.html");
+  if (isDevelopmentMode) {
+    // In development mode without a build, return a helpful message
+    return res.status(200).send(`
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>DocSimplify - Development Mode</title>
+          <style>
+            body { font-family: Arial; margin: 50px; }
+            .error { color: #d32f2f; margin: 20px 0; }
+            .warning { color: #f57c00; margin: 20px 0; }
+            code { background: #f5f5f5; padding: 2px 6px; border-radius: 3px; }
+          </style>
+        </head>
+        <body>
+          <h1>DocSimplify - Development Mode</h1>
+          <p>Application is running in development mode without a production build.</p>
+          <div class="warning">
+            <strong>⚠️ Production build required:</strong>
+            <p>Run <code>npm run build</code> to generate the frontend assets in the <code>dist/</code> folder.</p>
+          </div>
+          <p>After building, restart the server to serve the complete application.</p>
+          <hr>
+          <p><strong>API Routes Available:</strong></p>
+          <ul>
+            <li>POST /api/login - User login</li>
+            <li>POST /api/register - User registration</li>
+            <li>POST /api/process - Process and simplify documents</li>
+            <li>GET /api/profile - Get user profile</li>
+            <li>GET /api/history - Get processing history</li>
+          </ul>
+        </body>
+      </html>
+    `);
+  }
+  
+  res.sendFile(indexPath, (err) => {
+    if (err) {
+      res.status(404).json({ error: "Frontend assets not found. Run 'npm run build' first." });
+    }
+  });
+});
+
 export default app;
+
+// Start server if running directly (not imported as module)
+// Check if this is being run as the main module
+if (process.env.NODE_ENV !== "production" && process.argv[1]?.includes("server")) {
+  const server = app.listen(PORT, () => {
+    console.log(`[Server] Listening on http://localhost:${PORT}`);
+    if (isDevelopmentMode) {
+      console.warn("[Dev Mode] Frontend build not found. Run 'npm run build' to generate assets.");
+    }
+  }).on('error', (err) => {
+    console.error('[Server Error]', err);
+    process.exit(1);
+  });
+}

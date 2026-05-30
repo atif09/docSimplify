@@ -371,7 +371,7 @@ export default function App() {
 
 console.log("RAW ERROR RESPONSE:", responseText);
 
-let errData = {};
+let errData: any = {};
 
 try {
   errData = responseText ? JSON.parse(responseText) : {};
