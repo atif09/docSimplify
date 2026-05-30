@@ -21,21 +21,29 @@ app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 
 // Initialize Firebase Admin SDK safely using the Vercel Service Account environment variable
+// Safer, non-crashing Firebase initialization fallback
 if (!admin.apps.length) {
   try {
     const serviceAccountStr = process.env.FIREBASE_SERVICE_ACCOUNT;
     if (serviceAccountStr) {
-      const serviceAccount = JSON.parse(serviceAccountStr);
+      // Clean up potential hidden carriage returns or pasted formatting artifacts
+      const cleanedJson = serviceAccountStr.trim().replace(/[\u200B-\u200D\uFEFF]/g, "");
+      const serviceAccount = JSON.parse(cleanedJson);
+      
+      // Fix specific private key formatting escapes for Vercel
+      if (serviceAccount.private_key) {
+        serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+      }
+
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount)
       });
-      console.log("[Firebase] Successfully connected backend to Firestore!");
-    } else {
-      console.warn("[Firebase] FIREBASE_SERVICE_ACCOUNT variable missing. Falling back to default empty memory states.");
+      console.log("[Firebase] Safely connected to Firestore.");
     }
   } catch (err) {
-    console.error("[Firebase] Initialization failed:", err);
+    console.error("[Firebase Initialization Warning]: Continuing in local fallback mode.", err);
   }
+}
 }
 
 // Instance reference to Firestore database
@@ -372,18 +380,19 @@ app.post("/api/process", async (req, res) => {
 
     const finalPrompt = `
 ${inputSourcePrompt}
-You are acting as an expert Government NLP Architect. Return a strict JSON response containing:
-1. isGovernmentRelated (boolean)
-2. documentType (string)
-3. trustScoreImpact (integer between -5 and +5)
-4. title (respectful title)
-5. summary (1 sentence summary)
-6. simplifiedEnglish (8th-grade reading level explanation)
-7. teluguTranslation (Simplified plain Telugu translation text)
-8. hindiTranslation (Simplified plain Hindi translation text)
-9. glossary (array of terms and plain definitions)
-`;
+Act as an expert Government NLP Architect. Return a strict JSON response containing:
+1. isGovernmentRelated (boolean: true if related to Indian public/gov/municipal/policy matters, else false)
+2. documentType (string: short genre e.g. "Circular")
+3. trustScoreImpact (integer: 3 if related, else -5)
+4. title (string: short readable title)
+5. summary (string: 1 sentence)
+6. simplifiedEnglish (string: clear 8th-grade level summary)
+7. teluguTranslation (string: plain short Telugu summary)
+8. hindiTranslation (string: plain short Hindi summary)
+9. glossary (array of max 3 items containing short term and definition objects)
 
+Keep translations highly concise to maximize processing speeds.
+`;
     parts.push({ text: finalPrompt });
 
     const modelResponse = await generateContentWithFallback(ai, {
