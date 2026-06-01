@@ -6,74 +6,28 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
+import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
-import * as admin from "firebase-admin";
-import { fileURLToPath } from "url";
 
 // Load environment variables
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Handle __dirname for ESM context - use try/catch for compatibility
-let __dirname: string;
-try {
-  __dirname = path.dirname(fileURLToPath(import.meta.url));
-} catch (e) {
-  __dirname = process.cwd();
-}
+const PORT = 3000;
 
 // Set up body parsing limits to handle base64 documents (PDF/images)
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 
-// Serve static files from dist directory (Vite build output)
-const distPath = path.resolve(__dirname, "dist");
-const indexHtmlPath = path.join(distPath, "index.html");
+// Path to file-based persistent history database
+const isVercel = !!process.env.VERCEL;
+const BUNDLED_DB_PATH = path.join(process.cwd(), "user_history.json");
+const HISTORY_FILE_PATH = isVercel 
+  ? path.join("/tmp", "user_history.json") 
+  : BUNDLED_DB_PATH;
 
-// Check if dist/index.html exists, if not we're in dev mode without a build
-const isDevelopmentMode = !fs.existsSync(indexHtmlPath);
-
-if (!isDevelopmentMode) {
-  app.use(express.static(distPath, { maxAge: "1h" }));
-}
-
-// In-Memory structural runtime fallback database to keep app alive if Firebase Credentials error out
-let fallbackMemoryDb: Record<string, any> = {};
-
-// Initialize Firebase Admin SDK with safe fallback boundaries
-let isFirebaseConnected = false;
-if (!admin.apps || admin.apps.length === 0) {
-  try {
-    const serviceAccountStr = process.env.FIREBASE_SERVICE_ACCOUNT;
-    if (serviceAccountStr) {
-      // Strips hidden spacing symbols, backslashes, or corrupt carriage artifacts
-      const cleanedJson = serviceAccountStr.trim().replace(/[\u200B-\u200D\uFEFF]/g, "");
-      const serviceAccount = JSON.parse(cleanedJson);
-      
-      if (serviceAccount.private_key) {
-        serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
-      }
-
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-      });
-      isFirebaseConnected = true;
-      console.log("[Firebase] Production secure interface active.");
-    } else {
-      console.warn("[Firebase] FIREBASE_SERVICE_ACCOUNT variable missing. Operating in runtime sandbox mode.");
-    }
-  } catch (err) {
-    console.error("[Firebase Initialization Failure] Intercepted crash, falling back to secure sandbox memory layers:", err);
-  }
-} else {
-  isFirebaseConnected = true;
-}
-
-const db = isFirebaseConnected && admin.apps && admin.apps.length > 0 ? admin.firestore() : null;
-
+// Default initial database structure
 interface UserData {
   trustScore: number;
   history: any[];
@@ -83,60 +37,89 @@ interface UserData {
   registered?: boolean;
 }
 
-const DEFAULT_USER_DATA: UserData = {
+interface DbStructure {
+  users?: Record<string, UserData>;
+  trustScore: number;
+  history: any[];
+  saved: any[];
+  userProfile: {
+    email: string;
+    displayName: string;
+  };
+}
+
+const DEFAULT_DB: DbStructure = {
+  users: {},
   trustScore: 85,
   history: [],
   saved: [],
-  displayName: "Citizen User",
-  phoneNumber: "",
-  registered: true
+  userProfile: {
+    email: "citizen@gov.in",
+    displayName: "Citizen User"
+  }
 };
 
-// --- Secure Async Database Wrappers ---
-
-async function getUserFirestoreData(email: string): Promise<UserData> {
-  const normEmail = (email || "citizen@gov.in").trim().toLowerCase();
-  
-  if (!db) {
-    if (!fallbackMemoryDb[normEmail]) {
-      fallbackMemoryDb[normEmail] = { ...DEFAULT_USER_DATA };
-    }
-    return fallbackMemoryDb[normEmail];
-  }
-
+// Initialize file database helper
+function loadDb(): DbStructure {
   try {
-    const userDoc = await db.collection("users").doc(normEmail).get();
-    if (!userDoc.exists) {
-      return { ...DEFAULT_USER_DATA };
+    if (fs.existsSync(HISTORY_FILE_PATH)) {
+      const raw = fs.readFileSync(HISTORY_FILE_PATH, "utf-8");
+      return JSON.parse(raw);
+    } else if (isVercel && fs.existsSync(BUNDLED_DB_PATH)) {
+      // In Vercel, copy the bundled DB to /tmp on first read to avoid EROFS and pre-populate accounts
+      const raw = fs.readFileSync(BUNDLED_DB_PATH, "utf-8");
+      try {
+        fs.writeFileSync(HISTORY_FILE_PATH, raw, "utf-8");
+      } catch (writeErr) {
+        console.error("Failed to copy bundled db to /tmp", writeErr);
+      }
+      return JSON.parse(raw);
     }
-    const data = userDoc.data() as any;
-    return {
-      trustScore: data.trustScore !== undefined ? data.trustScore : 85,
-      history: data.history || [],
-      saved: data.saved || [],
-      displayName: data.displayName || "Citizen User",
-      phoneNumber: data.phoneNumber || "",
-      registered: data.registered !== undefined ? data.registered : true
-    };
   } catch (err) {
-    console.error(`[Database Read Intercept] Reading via transient sandbox state for ${normEmail}`);
-    if (!fallbackMemoryDb[normEmail]) fallbackMemoryDb[normEmail] = { ...DEFAULT_USER_DATA };
-    return fallbackMemoryDb[normEmail];
+    console.error("Failed to read user history db, resetting", err);
   }
+  return DEFAULT_DB;
 }
 
-async function saveUserFirestoreData(email: string, data: UserData): Promise<void> {
+// Helper to retrieve or create user-specific session container securely
+function getUserData(db: any, email: string): UserData {
   const normEmail = (email || "citizen@gov.in").trim().toLowerCase();
-  if (!db) {
-    fallbackMemoryDb[normEmail] = data;
-    return;
+  
+  if (!db.users) {
+    db.users = {};
   }
+  
+  // Backward compatibility migration: If legacy fields exist and show records, migrate them to their proper email bucket
+  if (db.history && db.history.length > 0) {
+    const legacyEmail = (db.userProfile?.email || "citizen@gov.in").trim().toLowerCase();
+    if (!db.users[legacyEmail]) {
+      db.users[legacyEmail] = {
+        trustScore: db.trustScore !== undefined ? db.trustScore : 85,
+        history: db.history || [],
+        saved: db.saved || []
+      };
+    }
+    // Delete legacy layout to prevent cross-contamination
+    db.history = [];
+    db.saved = [];
+  }
+  
+  if (!db.users[normEmail]) {
+    db.users[normEmail] = {
+      trustScore: 85,
+      history: [],
+      saved: []
+    };
+  }
+  
+  return db.users[normEmail];
+}
 
+function saveDb(data: DbStructure) {
   try {
-    await db.collection("users").doc(normEmail).set(data, { merge: true });
+    fs.writeFileSync(HISTORY_FILE_PATH, JSON.stringify(data, null, 2), "utf-8");
   } catch (err) {
-    console.error(`[Database Write Intercept] Writing via internal session state for ${normEmail}`);
-    fallbackMemoryDb[normEmail] = data;
+    console.error("Failed to save history db", err);
   }
 }
 
@@ -144,342 +127,469 @@ async function saveUserFirestoreData(email: string, data: UserData): Promise<voi
 let geminiClient: GoogleGenAI | null = null;
 function getGeminiClient(): GoogleGenAI {
   if (!geminiClient) {
-    // Try multiple sources for the API key (supports both local .env and Vercel env vars)
-    const key = process.env.GEMINI_API_KEY || 
-                process.env.VITE_GEMINI_API_KEY ||
-                (typeof window !== "undefined" && (window as any).__VITE_GEMINI_API_KEY);
-    
+    const key = process.env.GEMINI_API_KEY;
     if (!key || key === "MY_GEMINI_API_KEY") {
-      throw new Error("Generative engine key missing or unassigned in cloud profile settings. Set GEMINI_API_KEY environment variable.");
+      throw new Error("GEMINI_API_KEY is not configured in Secrets. Please define it in your environment.");
     }
     geminiClient = new GoogleGenAI({
       apiKey: key,
-      httpOptions: { headers: { "User-Agent": "aistudio-build" } }
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        }
+      }
     });
   }
   return geminiClient;
 }
 
+// Robust fallback wrapper with Exponential Backoff for 503 errors and Model fallbacks
 async function generateContentWithFallback(ai: GoogleGenAI, params: { contents: any; config: any }) {
-  const models = ["gemini-2.5-flash", "gemini-1.5-flash"];
+  const models = ["gemini-3.5-flash", "gemini-3.1-flash-lite"];
   let lastError: any = null;
 
   for (const modelName of models) {
-    let retries = 1;
-    while (retries >= 0) {
+    let retries = 4;
+    let delay = 800;
+
+    while (retries > 0) {
       try {
-        return await ai.models.generateContent({
+        console.log(`[Gemini API] Querying model: ${modelName} (${retries} attempts remaining)...`);
+        const response = await ai.models.generateContent({
           model: modelName,
           contents: params.contents,
           config: params.config,
         });
+        if (response) {
+          console.log(`[Gemini API] Successfully generated content using model: ${modelName}`);
+          return response;
+         }
       } catch (error: any) {
         lastError = error;
-        retries--;
+        const errStr = String(error?.message || error?.status || error || "").toLowerCase();
+
+        const isTransient =
+          errStr.includes("503") ||
+          errStr.includes("unavailable") ||
+          errStr.includes("high demand") ||
+          errStr.includes("resource_exhausted") ||
+          errStr.includes("429") ||
+          errStr.includes("rate limit") ||
+          errStr.includes("temp");
+
+        if (isTransient && retries > 1) {
+          // Add random jitter to mitigate concurrent client retries
+          const jitter = Math.floor(Math.random() * 400) - 200;
+          const finalDelay = Math.max(200, delay + jitter);
+          console.log(`[Gemini API] Model ${modelName} is busy (demand spike detected). Recalibrating request in ${finalDelay}ms...`);
+          await new Promise((resolve) => setTimeout(resolve, finalDelay));
+          delay *= 1.8;
+          retries--;
+        } else {
+          // Not transient or no retries left; continue to try the next model configuration
+          console.log(`[Gemini API] Model ${modelName} transitioned. Moving to backup models for complete delivery.`);
+          break;
+        }
       }
     }
   }
-  throw lastError || new Error("Generative layer connection dropped via structural timeouts.");
+
+  throw lastError || new Error("All designated generative model configurations returned error.");
 }
 
-// --- API Router Endpoints ---
+// Ensure database file is initialized
+if (!fs.existsSync(HISTORY_FILE_PATH)) {
+  saveDb(DEFAULT_DB);
+}
 
-app.get("/api/profile", async (req, res) => {
-  try {
-    const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
-    const userData = await getUserFirestoreData(email);
-    res.json({ email, displayName: userData.displayName || "Citizen User", trustScore: userData.trustScore });
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
+// API Routes
+
+// 1. Get User Profile & trust score
+app.get("/api/profile", (req, res) => {
+  const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
+  const db = loadDb();
+  const userData = getUserData(db, email);
+  res.json({
+    email: email,
+    displayName: userData.displayName || db.userProfile?.displayName || "Citizen User",
+    trustScore: userData.trustScore
+  });
 });
 
-app.post("/api/profile/update", async (req, res) => {
-  try {
-    const { displayName, email, phoneNumber } = req.body;
-    const targetEmail = email || (req.headers["x-user-email"] as string) || "citizen@gov.in";
-    const userData = await getUserFirestoreData(targetEmail);
-    if (displayName) userData.displayName = displayName;
-    if (phoneNumber) userData.phoneNumber = phoneNumber;
-    await saveUserFirestoreData(targetEmail, userData);
-    res.json({ status: "success", profile: { email: targetEmail, displayName: userData.displayName } });
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
+// Update profile preferences
+app.post("/api/profile/update", (req, res) => {
+  const { displayName, email, phoneNumber } = req.body;
+  const db = loadDb();
+  if (email) {
+    const normEmail = email.toLowerCase();
+    const userData = getUserData(db, normEmail);
+    if (displayName) {
+      userData.displayName = displayName;
+    }
+    if (phoneNumber) {
+      userData.phoneNumber = phoneNumber;
+    }
+    if (!db.userProfile) db.userProfile = { email: "", displayName: "" };
+    db.userProfile.email = email;
+    if (displayName) db.userProfile.displayName = displayName;
+  } else if (displayName) {
+    if (!db.userProfile) db.userProfile = { email: "", displayName: "" };
+    db.userProfile.displayName = displayName;
   }
+  saveDb(db);
+  res.json({ status: "success", profile: db.userProfile });
 });
 
-app.post("/api/register", async (req, res) => {
-  try {
-    const { displayName, email, phoneNumber } = req.body;
-    if (!email) return res.status(400).json({ error: "Email parameter required." });
+// Explicit registration endpoint: saves the user with verified status
+app.post("/api/register", (req, res) => {
+  const { displayName, email, phoneNumber } = req.body;
+  if (!email) {
+    return res.status(400).json({ error: "Email is required for registration" });
+  }
+  const db = loadDb();
+  const normEmail = email.trim().toLowerCase();
+  
+  if (!db.users) {
+    db.users = {};
+  }
+  
+  db.users[normEmail] = {
+    trustScore: 85,
+    history: [],
+    saved: [],
+    displayName: displayName || "John Doe",
+    phoneNumber: phoneNumber || "",
+    registered: true
+  };
+  
+  saveDb(db);
+  res.json({ 
+    status: "success", 
+    profile: {
+      email: normEmail,
+      displayName: db.users[normEmail].displayName,
+      trustScore: 85,
+      isLoggedIn: true
+    }
+  });
+});
+
+// Lookup email by phone number
+app.post("/api/lookup-phone", (req, res) => {
+  const { phoneNumber } = req.body;
+  if (!phoneNumber) {
+    return res.status(400).json({ error: "Phone number is required." });
+  }
+  
+  const db = loadDb();
+  const cleanPhone = phoneNumber.trim().replace(/\s+/g, "").replace(/\+/g, "");
+  
+  if (!db.users) {
+    return res.status(404).json({ error: "No users registered yet." });
+  }
+  
+  // Find in local memory database
+  const email = Object.keys(db.users).find(e => {
+    const userPhone = db.users[e].phoneNumber || "";
+    if (!userPhone) return false;
     
-    const normEmail = email.trim().toLowerCase();
-    const registrationData: UserData = {
+    const uDigits = userPhone.replace(/\D/g, "");
+    const qDigits = phoneNumber.trim().replace(/\D/g, "");
+    if (!uDigits || !qDigits) return false;
+    
+    if (uDigits === qDigits) return true;
+    
+    const u10 = uDigits.length >= 10 ? uDigits.slice(-10) : uDigits;
+    const q10 = qDigits.length >= 10 ? qDigits.slice(-10) : qDigits;
+    
+    return u10 === q10;
+  });
+
+  if (email) {
+    return res.json({ email: email.toLowerCase() });
+  }
+
+  res.status(404).json({ error: "This phone number is not registered. Please select the 'New Citizen? Register' link below first." });
+});
+
+// Explicit login validation: ensures users are registered/initialized in the National Portal database
+app.post("/api/login", (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).json({ error: "Email is required for login check." });
+  }
+  const db = loadDb();
+  const normEmail = email.trim().toLowerCase();
+  
+  if (!db.users) {
+    db.users = {};
+  }
+  
+  // If the user database document does not exist yet for this email, auto-initialize it safely
+  if (!db.users[normEmail] || !db.users[normEmail].registered) {
+    const computedName = normEmail.split("@")[0].split(/[._+-]/)
+      .map(p => p.charAt(0).toUpperCase() + p.slice(1))
+      .join(" ") || "Citizen User";
+      
+    db.users[normEmail] = {
       trustScore: 85,
       history: [],
       saved: [],
-      displayName: displayName || "Citizen User",
-      phoneNumber: phoneNumber || "",
+      displayName: computedName,
+      phoneNumber: "",
       registered: true
     };
-    
-    await saveUserFirestoreData(normEmail, registrationData);
-    res.json({ status: "success", profile: { email: normEmail, displayName: registrationData.displayName, trustScore: 85, isLoggedIn: true } });
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
+    saveDb(db);
   }
-});
-
-app.post("/api/lookup-phone", async (req, res) => {
-  try {
-    const { phoneNumber } = req.body;
-    if (!phoneNumber) return res.status(400).json({ error: "Phone signature parameter empty." });
-    
-    const cleanQueryPhone = phoneNumber.trim().replace(/\D/g, "");
-    let foundEmail: string | null = null;
-
-    if (db) {
-      const snapshot = await db.collection("users").get();
-      snapshot.forEach(doc => {
-        const uData = doc.data();
-        const userPhone = (uData.phoneNumber || "").replace(/\D/g, "");
-        if (userPhone && userPhone.slice(-10) === cleanQueryPhone.slice(-10)) foundEmail = doc.id;
-      });
+  
+  const userData = db.users[normEmail];
+  res.json({
+    status: "success",
+    profile: {
+      email: normEmail,
+      displayName: userData.displayName || "John Doe",
+      trustScore: userData.trustScore || 85,
+      isLoggedIn: true
     }
-
-    if (foundEmail) return res.json({ email: (foundEmail as string).toLowerCase() });
-    res.status(404).json({ error: "Credential signature unrecognized. Register an original profile below first." });
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
+  });
 });
 
-app.post("/api/login", async (req, res) => {
-  try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: "Identity string required." });
-    const normEmail = email.trim().toLowerCase();
-    
-    const userData = await getUserFirestoreData(normEmail);
-    if (!userData.registered) {
-      const computedName = normEmail.split("@")[0].split(/[._+-]/).map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(" ") || "Citizen User";
-      userData.displayName = computedName;
-      userData.registered = true;
-      await saveUserFirestoreData(normEmail, userData);
+// 2. Fetch recent document history
+app.get("/api/history", (req, res) => {
+  const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
+  const db = loadDb();
+  const userData = getUserData(db, email);
+  res.json({
+    history: userData.history || [],
+    saved: userData.saved || [],
+    trustScore: userData.trustScore
+  });
+});
+
+// 3. Mark/unmark a result as saved
+app.post("/api/save", (req, res) => {
+  const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
+  const { documentId, saveState } = req.body;
+  const db = loadDb();
+  const userData = getUserData(db, email);
+  
+  if (saveState) {
+    // Find in user's history and push to saved if not present
+    const doc = userData.history.find(d => d.id === documentId);
+    if (doc) {
+      if (!userData.saved.some(s => s.id === documentId)) {
+        userData.saved.unshift(doc);
+      }
     }
-    
-    res.json({ status: "success", profile: { email: normEmail, displayName: userData.displayName, trustScore: userData.trustScore, isLoggedIn: true } });
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
+  } else {
+    // Remove from saved
+    userData.saved = userData.saved.filter(s => s.id !== documentId);
   }
+  
+  saveDb(db);
+  res.json({ status: "success", saved: userData.saved });
 });
 
-app.get("/api/history", async (req, res) => {
-  try {
-    const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
-    const userData = await getUserFirestoreData(email);
-    res.json({ history: userData.history || [], saved: userData.saved || [], trustScore: userData.trustScore });
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
+// Delete a document from history
+app.delete("/api/history/:id", (req, res) => {
+  const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
+  const { id } = req.params;
+  const db = loadDb();
+  const userData = getUserData(db, email);
+  userData.history = userData.history.filter(h => h.id !== id);
+  userData.saved = userData.saved.filter(s => s.id !== id);
+  saveDb(db);
+  res.json({ status: "success", history: userData.history, saved: userData.saved });
 });
 
-app.post("/api/save", async (req, res) => {
-  try {
-    const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
-    const { documentId, saveState } = req.body;
-    const userData = await getUserFirestoreData(email);
-    
-    if (saveState) {
-      const doc = userData.history.find(d => d.id === documentId);
-      if (doc && !userData.saved.some(s => s.id === documentId)) userData.saved.unshift(doc);
-    } else {
-      userData.saved = userData.saved.filter(s => s.id !== documentId);
-    }
-    await saveUserFirestoreData(email, userData);
-    res.json({ status: "success", saved: userData.saved });
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
+// Clear entire history
+app.post("/api/history/clear", (req, res) => {
+  const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
+  const db = loadDb();
+  const userData = getUserData(db, email);
+  userData.history = [];
+  userData.saved = [];
+  userData.trustScore = 85; // reset of trust score index
+  saveDb(db);
+  res.json({ status: "success", history: [], saved: [], trustScore: 85 });
 });
 
-app.delete("/api/history/:id", async (req, res) => {
-  try {
-    const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
-    const { id } = req.params;
-    const userData = await getUserFirestoreData(email);
-    userData.history = userData.history.filter(h => h.id !== id);
-    userData.saved = userData.saved.filter(s => s.id !== id);
-    await saveUserFirestoreData(email, userData);
-    res.json({ status: "success", history: userData.history, saved: userData.saved });
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post("/api/history/clear", async (req, res) => {
-  try {
-    const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
-    const userData = await getUserFirestoreData(email);
-    userData.history = [];
-    userData.saved = [];
-    userData.trustScore = 85; 
-    await saveUserFirestoreData(email, userData);
-    res.json({ status: "success", history: [], saved: [], trustScore: 85 });
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
+// 4. Document processing (Manual Paste Text or PDF/Image Base64 extraction)
 app.post("/api/process", async (req, res) => {
   const email = (req.headers["x-user-email"] as string) || "citizen@gov.in";
   const { text, fileData, fileName, mimeType, sourceLang } = req.body;
 
   if (!text && !fileData) {
-    return res.status(400).json({ error: "Missing document data parameters." });
+    return res.status(400).json({ error: "Provide either manually pasted text or a base64 encoded document file." });
   }
 
   try {
     const ai = getGeminiClient();
-    let parts: any[] = [];
-    const langLabel = sourceLang === "te" ? "Telugu" : sourceLang === "hi" ? "Hindi" : "English";
 
+    let inputSourcePrompt = "";
+    let parts: any[] = [];
+    const detectedSourceLang = sourceLang || "en";
+    const sourceLangText = detectedSourceLang === "te" ? "Telugu" : detectedSourceLang === "hi" ? "Hindi" : "English";
+
+    // If base64 file data is provided, append it to Gemini contents array so it can perform multimodal OCR/parsing
     if (fileData && mimeType) {
-      parts.push({ inlineData: { data: fileData, mimeType } });
-      parts.push({ text: `Analyze this document. Language hint: ${langLabel}.` });
+      parts.push({
+        inlineData: {
+          data: fileData,
+          mimeType: mimeType
+        }
+      });
+      inputSourcePrompt = `Analyze, OCR-extract, parse, translate, and simplify the attached document (named: "${fileName || 'document'}", mimeType: "${mimeType}"). The document's configured source language hint is: ${sourceLangText}. However, the document may be written in English, Telugu, Hindi, or a mix of any of these languages. Please dynamically detect the actual language(s) used and parse/OCR the contents appropriately.`;
     } else {
-      parts.push({ text: `Text: ${text}` });
+      parts.push({
+        text: `Here is the pasted text of the document to analyze: \n\n${text}`
+      });
+      inputSourcePrompt = `Analyze, translate, and simplify the following legal/official text. The document's configured source language hint is: ${sourceLangText}. However, the text may be written in English, Telugu, Hindi, or a mix of any of these languages. Please dynamically detect the actual language(s) used and translate/simplify appropriately.`;
     }
 
-    // Extremely lightweight processing structured prompt to explicitly resolve Vercel 10s deployment gateway drops
-    const minimalPrompt = `
-Act as an official NLP Architect. Return a tight JSON structure containing exactly:
-1. "isGovernmentRelated" (boolean: set to true always for validation pass)
-2. "documentType" (string: short genre max 3 words)
-3. "trustScoreImpact" (integer: value 3)
-4. "title" (string: official name)
-5. "summary" (string: 1 short sentence statement)
-6. "simplifiedEnglish" (string: 2 sentence summary clear interpretation)
-7. "teluguTranslation" (string: 1 sentence short Telugu overview text)
-8. "hindiTranslation" (string: 1 sentence short Hindi overview text)
-9. "glossary" (array containing exactly 1 object with keys "term" and "definition")
+    // Append system architectural rules with structured schemas
+    const finalPrompt = `
+${inputSourcePrompt}
 
-Process lightning fast. No long paragraphs.
+You are acting as an expert Government NLP Architect, Judiciary Translation Specialist, and Universal Citizen Advocate.
+Your mission is to perform these operations:
+1. Classification & Verification:
+   - Detect whether the content is related to an official Indian government, legal matter, public utility, municipal sector, welfare program, state/central notification, judicial filing, or relevant public policy issue in India. Set "isGovernmentRelated" to true if so, otherwise false.
+   - Categorize the exact "documentType", picking from or describing similar official genres: e.g., "Government Order", "Circular", "Welfare Scheme", "Tax & Customs Notice", "Judiciary Brief", "Public Notice", "Advisory", or "General Policy Brief".
+   - Determine "trustScoreImpact". If it is highly related to government policies, notifications, or welfare schemes, set the impact to positive (between +3 to +5). If the document is completely unrelated, personal chat, spam, or nonsense, set it to negative (between -5 and -10). If it contains some relevant context or is partial, set it to 0 or +1.
+2. Simplification & Metadata Generation:
+   - Give the document a standard human-readable, respectful "title" (e.g. "Pradhan Mantri Awas Yojana Guideline", "MCD Circular on Taxation").
+   - Extract a 1-sentence "summary" of the document.
+   - Simplify the legalistic, technical, or complex jargon of the document into "simplifiedEnglish" written at a clear, 8th-grade readability level (designed for ease of standard understanding).
+3. Translation:
+   - Accurately translate this simplified text into Telugu ("teluguTranslation"). Maintain high cultural precision and clean official Telugu lexicon. Avoid reading numbers incorrectly. Even if the source document was in Telugu, Hindi, or mixed, provide a high-quality, fully translated simplified Telugu output.
+   - Accurately translate this simplified text into Hindi ("hindiTranslation"). Use standard official yet easy-to-read Devanagari. Even if the source document was in Telugu, Hindi, or mixed, provide a high-quality, fully translated simplified Hindi output.
+4. Glossary Generation:
+   - Extract up to 6 complex legal, financial, or bureaucratic terms appearing in the document (mapped to their English terms if written in regional scripts or translated) and map each to a simple, plain-language explanation in "glossary" (term & definition).
+
+Response Schema Constraints:
+Your return message MUST strictly fulfill the JSON structure outlined in the configuration responseSchema. Ensure Telugu and Hindi texts are fully translated and returned in elegant unicode scripts without abbreviations or raw numbers where plain translations are appropriate. Set proper trustScoreImpact based on the actual relevance of the input content.
 `;
-    parts.push({ text: minimalPrompt });
+
+    parts.push({ text: finalPrompt });
 
     const modelResponse = await generateContentWithFallback(ai, {
-      contents: { parts },
+      contents: { parts: parts },
       config: {
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
           properties: {
-            isGovernmentRelated: { type: Type.BOOLEAN },
-            documentType: { type: Type.STRING },
-            trustScoreImpact: { type: Type.INTEGER },
-            title: { type: Type.STRING },
-            summary: { type: Type.STRING },
-            simplifiedEnglish: { type: Type.STRING },
-            teluguTranslation: { type: Type.STRING },
-            hindiTranslation: { type: Type.STRING },
+            isGovernmentRelated: { type: Type.BOOLEAN, description: "Whether the document is official/governmental/public-service oriented" },
+            documentType: { type: Type.STRING, description: "Classification genre of the document" },
+            trustScoreImpact: { type: Type.INTEGER, description: "Change score for trust (-10 to +5)" },
+            title: { type: Type.STRING, description: "Clean, institutional title for this document" },
+            summary: { type: Type.STRING, description: "One-sentence high-level summary" },
+            simplifiedEnglish: { type: Type.STRING, description: "Plain simple-English interpretation of the core provisions" },
+            teluguTranslation: { type: Type.STRING, description: "High-quality simplified Telugu translation of the simplified English" },
+            hindiTranslation: { type: Type.STRING, description: "High-quality simplified Hindi translation of the simplified English" },
             glossary: {
               type: Type.ARRAY,
+              description: "Array of complex terms with their plain-English definitions",
               items: {
                 type: Type.OBJECT,
-                properties: { term: { type: Type.STRING }, definition: { type: Type.STRING } },
+                properties: {
+                  term: { type: Type.STRING, description: "The legal/bureaucratic jargon term" },
+                  definition: { type: Type.STRING, description: "Simple plain-language definition" }
+                },
                 required: ["term", "definition"]
               }
             }
           },
-          required: ["isGovernmentRelated", "documentType", "trustScoreImpact", "title", "summary", "simplifiedEnglish", "teluguTranslation", "hindiTranslation", "glossary"]
+          required: [
+            "isGovernmentRelated",
+            "documentType",
+            "trustScoreImpact",
+            "title",
+            "summary",
+            "simplifiedEnglish",
+            "teluguTranslation",
+            "hindiTranslation",
+            "glossary"
+          ]
         }
       }
     });
 
     const outputText = modelResponse.text;
-    if (!outputText) throw new Error("Generative pipeline engine timed out.");
+    if (!outputText) {
+      throw new Error("Empty response received from the simplification AI");
+    }
 
     const docuDetails = JSON.parse(outputText);
-    const userData = await getUserFirestoreData(email);
+
+    // Explicit Verification: If the uploaded document is not government-related, halt and notify failure
+    if (docuDetails.isGovernmentRelated === false || !docuDetails.isGovernmentRelated) {
+      return res.status(400).json({
+        error: "Failed to translate because the uploaded document is not government-related"
+      });
+    }
+
+    // Save to persistent database
+    const db = loadDb();
     const documentId = "doc_" + Math.random().toString(36).substring(2, 11);
+    
+    // Update that specific user's trust score within safe boundaries (10 to 100)
+    const userData = getUserData(db, email);
+    const existingScore = userData.trustScore || 85;
+    const proposedScore = existingScore + (docuDetails.trustScoreImpact || 0);
+    const newScore = Math.max(10, Math.min(100, proposedScore));
+    userData.trustScore = newScore;
 
     const newDocItem = {
       id: documentId,
-      originalText: text || `[Document Upload: ${fileName || "file"}]`,
+      originalText: text || `[Multimodal Document Upload: ${fileName || "document.bin"}]`,
       timestamp: new Date().toISOString(),
       ...docuDetails
     };
 
-    if (!userData.history) userData.history = [];
     userData.history.unshift(newDocItem);
-    await saveUserFirestoreData(email, userData);
+    saveDb(db);
 
-    res.json({ status: "success", trustScore: userData.trustScore, result: newDocItem });
+    res.json({
+      status: "success",
+      trustScore: newScore,
+      result: newDocItem
+    });
+
   } catch (error: any) {
-    console.error("Pipeline failure caught:", error);
-    res.status(500).json({ error: error.message || "The platform gateway is calibrating engine parameters. Retry shortly." });
+    console.error("Gemini simplifier service failed:", error);
+    res.status(500).json({
+      error: error.message || "simplification service errored. Verify database or credentials.",
+      suggestion: "Make sure GEMINI_API_KEY is configured under Settings > Secrets."
+    });
   }
 });
 
-// SPA Catch-all route - serve index.html for all non-API routes
-app.get("*", (req, res) => {
-  const indexPath = path.resolve(distPath, "index.html");
-  if (isDevelopmentMode) {
-    // In development mode without a build, return a helpful message
-    return res.status(200).send(`
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <title>DocSimplify - Development Mode</title>
-          <style>
-            body { font-family: Arial; margin: 50px; }
-            .error { color: #d32f2f; margin: 20px 0; }
-            .warning { color: #f57c00; margin: 20px 0; }
-            code { background: #f5f5f5; padding: 2px 6px; border-radius: 3px; }
-          </style>
-        </head>
-        <body>
-          <h1>DocSimplify - Development Mode</h1>
-          <p>Application is running in development mode without a production build.</p>
-          <div class="warning">
-            <strong>⚠️ Production build required:</strong>
-            <p>Run <code>npm run build</code> to generate the frontend assets in the <code>dist/</code> folder.</p>
-          </div>
-          <p>After building, restart the server to serve the complete application.</p>
-          <hr>
-          <p><strong>API Routes Available:</strong></p>
-          <ul>
-            <li>POST /api/login - User login</li>
-            <li>POST /api/register - User registration</li>
-            <li>POST /api/process - Process and simplify documents</li>
-            <li>GET /api/profile - Get user profile</li>
-            <li>GET /api/history - Get processing history</li>
-          </ul>
-        </body>
-      </html>
-    `);
+// Setup Vite & Static Files Hosting
+async function startServer() {
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
   }
-  
-  res.sendFile(indexPath, (err) => {
-    if (err) {
-      res.status(404).json({ error: "Frontend assets not found. Run 'npm run build' first." });
-    }
-  });
-});
 
-export default app;
-
-// Start server if running directly (not imported as module)
-// Check if this is being run as the main module
-if (process.env.NODE_ENV !== "production" && process.argv[1]?.includes("server")) {
-  const server = app.listen(PORT, () => {
-    console.log(`[Server] Listening on http://localhost:${PORT}`);
-    if (isDevelopmentMode) {
-      console.warn("[Dev Mode] Frontend build not found. Run 'npm run build' to generate assets.");
-    }
-  }).on('error', (err) => {
-    console.error('[Server Error]', err);
-    process.exit(1);
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`DocuEase Server running on client-accessible port ${PORT}`);
   });
 }
+
+// Only start the standalone HTTP server if we are NOT running inside Vercel's Serverless Function environment
+if (!process.env.VERCEL) {
+  startServer();
+}
+
+export default app;

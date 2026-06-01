@@ -24,6 +24,8 @@ import {
   Check, 
   UploadCloud, 
   Clipboard, 
+  Copy,
+  Printer,
   AlertTriangle, 
   ExternalLink,
   BookOpen,
@@ -61,7 +63,9 @@ export default function App() {
   const [inputText, setInputText] = useState<string>("");
   const [fileDetails, setFileDetails] = useState<{ name: string; size: string; type: string; base64: string } | null>(null);
   const [dragActive, setDragActive] = useState<boolean>(false);
-  const [complexityMode, setComplexityMode] = useState<"summary" | "plain" | "literal">("plain");
+  const [complexityMode, setComplexityMode] = useState<"summary" | "plain" | "literal" | "overlay">("plain");
+  const [hoveredOrigIdx, setHoveredOrigIdx] = useState<number>(0);
+  const [overlayCopied, setOverlayCopied] = useState<boolean>(false);
 
   // Output States & Processing states
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
@@ -367,20 +371,7 @@ export default function App() {
       if (!response.ok) {
         let errMsg = "Platform gateway dropped connection.";
         try {
-          const responseText = await response.text();
-
-console.log("RAW ERROR RESPONSE:", responseText);
-
-let errData: any = {};
-
-try {
-  errData = responseText ? JSON.parse(responseText) : {};
-} catch (error) {
-  console.error("JSON Parse Failed:", error);
-  errData = {
-    message: responseText
-  };
-}
+          const errData = await response.json();
           errMsg = errData.error || errMsg;
         } catch (jsonErr) {
           try {
@@ -650,6 +641,134 @@ try {
     return result.filter(s => s.length > 1);
   };
 
+  // Bidirectional Jaccard / Proportional text alignment & glossary highlighter for Overlay Comparison Mode
+  const getMatchedSimplifiedIndex = (origIdx: number, sentsOrig: string[], sentsSimp: string[]): number => {
+    if (sentsOrig.length === 0 || sentsSimp.length === 0) return 0;
+    
+    const origSent = sentsOrig[origIdx];
+    if (!origSent) return 0;
+
+    // Compute clean lowercase words list (supports English and standard Indian unicode letters)
+    const origWords = new Set(
+      origSent.toLowerCase()
+        .replace(/[^\w\s\u0900-\u097F\u0C00-\u0C7F]/g, "")
+        .split(/\s+/)
+        .filter(w => w.length > 2)
+    );
+
+    if (origWords.size === 0) {
+      const ratio = sentsSimp.length / sentsOrig.length;
+      return Math.min(Math.floor(origIdx * ratio), sentsSimp.length - 1);
+    }
+
+    let bestIndex = 0;
+    let maxOverlap = -1;
+
+    for (let i = 0; i < sentsSimp.length; i++) {
+      const simpWords = sentsSimp[i].toLowerCase()
+        .replace(/[^\w\s\u0900-\u097F\u0C00-\u0C7F]/g, "")
+        .split(/\s+/)
+        .filter(w => w.length > 2);
+        
+      let overlap = 0;
+      for (const w of simpWords) {
+        if (origWords.has(w)) {
+          overlap++;
+        }
+      }
+      
+      if (overlap > maxOverlap) {
+        maxOverlap = overlap;
+        bestIndex = i;
+      }
+    }
+
+    if (maxOverlap <= 0) {
+      const ratio = sentsSimp.length / sentsOrig.length;
+      return Math.min(Math.floor(origIdx * ratio), sentsSimp.length - 1);
+    }
+
+    return bestIndex;
+  };
+
+  const getMatchedOriginalIndex = (simpIdx: number, sentsOrig: string[], sentsSimp: string[]): number => {
+    if (sentsOrig.length === 0 || sentsSimp.length === 0) return 0;
+    
+    const simpSent = sentsSimp[simpIdx];
+    if (!simpSent) return 0;
+
+    const simpWords = new Set(
+      simpSent.toLowerCase()
+        .replace(/[^\w\s\u0900-\u097F\u0C00-\u0C7F]/g, "")
+        .split(/\s+/)
+        .filter(w => w.length > 2)
+    );
+
+    if (simpWords.size === 0) {
+      const ratio = sentsOrig.length / sentsSimp.length;
+      return Math.min(Math.floor(simpIdx * ratio), sentsOrig.length - 1);
+    }
+
+    let bestIndex = 0;
+    let maxOverlap = -1;
+
+    for (let i = 0; i < sentsOrig.length; i++) {
+      const origWords = sentsOrig[i].toLowerCase()
+        .replace(/[^\w\s\u0900-\u097F\u0C00-\u0C7F]/g, "")
+        .split(/\s+/)
+        .filter(w => w.length > 2);
+        
+      let overlap = 0;
+      for (const w of origWords) {
+        if (simpWords.has(w)) {
+          overlap++;
+        }
+      }
+      
+      if (overlap > maxOverlap) {
+        maxOverlap = overlap;
+        bestIndex = i;
+      }
+    }
+
+    if (maxOverlap <= 0) {
+      const ratio = sentsOrig.length / sentsSimp.length;
+      return Math.min(Math.floor(simpIdx * ratio), sentsOrig.length - 1);
+    }
+
+    return bestIndex;
+  };
+
+  const renderTextWithGlossaryHighlights = (text: string, glossary: GlossaryItem[]) => {
+    if (!text || !glossary || glossary.length === 0) return text;
+
+    // Sort glossary terms longest first to avoid substring collision (e.g. matching 'tax' inside 'taxi')
+    const sortedGlossary = [...glossary].sort((a, b) => b.term.length - a.term.length);
+    const escapedTerms = sortedGlossary.map(g => g.term.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'));
+    
+    const regex = new RegExp(`(${escapedTerms.join('|')})`, 'gi');
+    const parts = text.split(regex);
+
+    return parts.map((part, index) => {
+      const matchedTerm = sortedGlossary.find(g => g.term.toLowerCase() === part.toLowerCase());
+      if (matchedTerm) {
+        return (
+          <span 
+            key={index} 
+            className="font-bold text-amber-800 bg-amber-50 h-fit border-b border-dashed border-amber-500 px-1 rounded cursor-help inline-block group relative"
+            title={matchedTerm.definition}
+          >
+            {part}
+            <span className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-1.5 hidden group-hover:block bg-slate-905 text-white text-[10px] p-2.5 rounded-lg shadow-lg max-w-xs z-50 w-52 leading-relaxed font-sans normal-case font-normal border border-slate-700">
+              <strong className="text-amber-350 block mb-0.5">{matchedTerm.term} (Glossary Definition):</strong> {matchedTerm.definition}
+            </span>
+          </span>
+        );
+      }
+      return part;
+    });
+  };
+
   // Text copy script
   const handleCopyText = (content: string, idPrefix: string) => {
     navigator.clipboard.writeText(content);
@@ -665,6 +784,42 @@ try {
         target.style.color = "";
       }, 1500);
     }
+  };
+
+  const handleCopyOverlaySideBySide = () => {
+    if (!currentResult) return;
+    const originalSentences = splitIntoSentences(currentResult.originalText);
+    const activeSimplifiedText = selectedLang === "te" 
+      ? currentResult.teluguTranslation 
+      : selectedLang === "hi" 
+        ? currentResult.hindiTranslation 
+        : currentResult.simplifiedEnglish;
+    const simplifiedSentences = splitIntoSentences(activeSimplifiedText);
+
+    let output = `======================================================================\n`;
+    output += `SIDE-BY-SIDE STUDY: ORIGINAL LEGALESE vs. CITIZEN SIMPLIFIED\n`;
+    output += `Document Title: ${currentResult.title || "Regulatory Information circular"}\n`;
+    output += `Language: ${selectedLang === "te" ? "Telugu | తెలుగు" : selectedLang === "hi" ? "Hindi | हिन्दी" : "Simplified English"}\n`;
+    output += `======================================================================\n\n`;
+
+    originalSentences.forEach((orig, idx) => {
+      const matchIdx = getMatchedSimplifiedIndex(idx, originalSentences, simplifiedSentences);
+      const simp = simplifiedSentences[matchIdx] || "(No direct translation found)";
+      output += `[Clause #${idx + 1}]\n`;
+      output += `ORIGINAL LEGALESE:\n${orig.trim()}\n\n`;
+      output += `SIMPLIFIED ALTERNATIVE:\n${simp.trim()}\n`;
+      output += `----------------------------------------------------------------------\n\n`;
+    });
+
+    navigator.clipboard.writeText(output);
+    setOverlayCopied(true);
+    setTimeout(() => {
+      setOverlayCopied(false);
+    }, 2000);
+  };
+
+  const handlePrintOverlay = () => {
+    window.print();
   };
 
   // Share via WhatsApp helper
@@ -1112,6 +1267,15 @@ try {
                             Plain Language View
                           </button>
                           <button
+                            id="tab_complexity_overlay"
+                            onClick={() => setComplexityMode("overlay")}
+                            className={`px-3 py-1.5 text-xs font-bold rounded transition cursor-pointer ${
+                              complexityMode === "overlay" ? "bg-gov-primary text-white" : "hover:bg-slate-100 text-slate-600"
+                            }`}
+                          >
+                            Overlay Comparison
+                          </button>
+                          <button
                             id="tab_complexity_literal"
                             onClick={() => setComplexityMode("literal")}
                             className={`px-3 py-1.5 text-xs font-bold rounded transition cursor-pointer ${
@@ -1238,6 +1402,277 @@ try {
                                 {currentResult.summary}
                               </p>
                             </div>
+                          ) : complexityMode === "overlay" ? (
+                            (() => {
+                              const originalSentences = currentResult ? splitIntoSentences(currentResult.originalText) : [];
+                              const activeSimplifiedText = currentResult 
+                                ? (selectedLang === "te" 
+                                    ? currentResult.teluguTranslation 
+                                    : selectedLang === "hi" 
+                                      ? currentResult.hindiTranslation 
+                                      : currentResult.simplifiedEnglish)
+                                : "";
+                              const simplifiedSentences = currentResult ? splitIntoSentences(activeSimplifiedText) : [];
+                              const activeOriginalSentence = originalSentences[hoveredOrigIdx] || "";
+                              const matchedSimpIndex = getMatchedSimplifiedIndex(hoveredOrigIdx, originalSentences, simplifiedSentences);
+                              const activeSimplifiedSentence = simplifiedSentences[matchedSimpIndex] || "";
+
+                              return (
+                                <div className="space-y-5" id="overlay_comparison_holder">
+                                  {/* Controls Header Bar */}
+                                  <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center bg-slate-50 border border-slate-200 p-3 rounded-lg gap-3" id="overlay_comparison_header_bar">
+                                    <div className="flex items-center gap-2">
+                                      <div className="w-2 h-2 rounded-full bg-amber-500 animate-pulse"></div>
+                                      <span className="text-xs font-bold text-slate-700">Overlay Comparison Utilities</span>
+                                    </div>
+                                    <div className="flex items-center gap-2 w-full sm:w-auto">
+                                      {/* Copy All Button */}
+                                      <button
+                                        id="overlay_copy_all_btn"
+                                        onClick={handleCopyOverlaySideBySide}
+                                        className={`inline-flex items-center justify-center gap-1.5 px-3 py-1.5 border hover:bg-slate-50 rounded text-xs font-semibold transition cursor-pointer grow sm:grow-0 ${
+                                          overlayCopied 
+                                            ? "bg-green-50 border-green-300 text-green-700" 
+                                            : "bg-white border-slate-300 text-slate-700 hover:border-slate-400"
+                                        }`}
+                                        title="Copy both original and simplified side-by-side"
+                                      >
+                                        {overlayCopied ? <Check size={13} /> : <Copy size={13} className="text-slate-500" />}
+                                        {overlayCopied ? "Copied Side-by-Side!" : "Copy Side-by-Side"}
+                                      </button>
+                                      {/* Print Button */}
+                                      <button
+                                        id="overlay_print_btn"
+                                        onClick={handlePrintOverlay}
+                                        className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 bg-white border border-slate-300 hover:border-slate-400 hover:bg-slate-50 rounded text-xs font-semibold text-slate-700 transition cursor-pointer grow sm:grow-0"
+                                        title="Print clean side-by-side comparison"
+                                      >
+                                        <Printer size={13} className="text-slate-500" />
+                                        Print Side-by-Side
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  {/* Introduction Explainer Banner */}
+                                  <div className="p-3.5 bg-blue-50 border border-blue-200 text-blue-800 rounded-lg text-xs leading-relaxed flex items-start gap-2.5">
+                                    <Info size={16} className="shrink-0 text-blue-600 mt-0.5" />
+                                    <div>
+                                      <strong className="font-bold">Interactive Overlay Comparison Mode:</strong> Hover or click on any clause in the left panel to highlight its matching simplified translation on the right. Key legal terms are highlighted with interactive tooltips defining official Indian legal terminology.
+                                    </div>
+                                  </div>
+
+                                  {/* Split Panels */}
+                                  <div className="grid grid-cols-1 md:grid-cols-2 gap-5" id="overlay_split_view">
+                                    {/* Left Panel: Original Legalese */}
+                                    <div className="border border-red-100 rounded-lg bg-orange-50/5 overflow-hidden flex flex-col h-[400px]">
+                                      <div className="bg-red-50/50 px-3.5 py-2.5 border-b border-red-150 flex items-center justify-between">
+                                        <span className="text-[10px] font-extrabold text-red-800 uppercase tracking-wider font-mono">
+                                          Original Legalese Version
+                                        </span>
+                                        <span className="text-[9px] bg-red-100/70 text-red-850 px-1.5 py-0.5 rounded font-mono font-bold">
+                                          {originalSentences.length} Clauses
+                                        </span>
+                                      </div>
+                                      <div className="p-3.5 space-y-2.5 overflow-y-auto flex-1 bg-white custom-scrollbar">
+                                        {originalSentences.length === 0 ? (
+                                          <p className="text-xs text-slate-400 italic">No complex sentences detected.</p>
+                                        ) : (
+                                          originalSentences.map((sent, idx) => {
+                                            const isSelected = hoveredOrigIdx === idx;
+                                            return (
+                                              <div
+                                                key={idx}
+                                                id={`overlay_orig_sent_${idx}`}
+                                                onClick={() => setHoveredOrigIdx(idx)}
+                                                onMouseEnter={() => setHoveredOrigIdx(idx)}
+                                                className={`p-2.5 rounded-lg border transition-all duration-150 cursor-pointer text-xs leading-relaxed ${
+                                                  isSelected
+                                                    ? "bg-red-50 border-red-300 text-red-950 font-medium shadow-xs ring-2 ring-red-400/10"
+                                                    : "border-slate-100 text-slate-500 hover:bg-slate-50 hover:text-slate-800 opacity-65 hover:opacity-100"
+                                                }`}
+                                              >
+                                                <div className="flex items-start gap-2">
+                                                  <span className={`text-[8px] font-bold px-1 py-0.2 rounded-sm mt-0.5 shrink-0 select-none ${
+                                                    isSelected ? "bg-red-200 text-red-800" : "bg-slate-200 text-slate-600"
+                                                  }`}>
+                                                    {idx + 1}
+                                                  </span>
+                                                  <div className="grow select-text">
+                                                    {renderTextWithGlossaryHighlights(sent, currentResult.glossary || [])}
+                                                  </div>
+                                                </div>
+                                              </div>
+                                            );
+                                          })
+                                        )}
+                                      </div>
+                                    </div>
+
+                                    {/* Right Panel: Simplified Clean Text */}
+                                    <div className="border border-green-100 rounded-lg bg-green-50/5 overflow-hidden flex flex-col h-[400px]">
+                                      <div className="bg-green-50/50 px-3.5 py-2.5 border-b border-green-150 flex items-center justify-between">
+                                        <span className="text-[10px] font-extrabold text-green-800 uppercase tracking-wider font-mono">
+                                          Citizen-Friendly Translation
+                                        </span>
+                                        <span className="text-[9px] bg-green-100/70 text-green-850 px-1.5 py-0.5 rounded font-mono font-bold">
+                                          {selectedLang === "te" ? "Telugu | తెలుగు" : selectedLang === "hi" ? "Hindi | हिन्दी" : "Simplified English"}
+                                        </span>
+                                      </div>
+                                      <div className="p-3.5 space-y-2.5 overflow-y-auto flex-1 bg-white custom-scrollbar">
+                                        {simplifiedSentences.length === 0 ? (
+                                          <p className="text-xs text-slate-400 italic">No simplified compilation found.</p>
+                                        ) : (
+                                          simplifiedSentences.map((sent, idx) => {
+                                            const isSelected = matchedSimpIndex === idx;
+                                            return (
+                                              <div
+                                                key={idx}
+                                                id={`overlay_simp_sent_${idx}`}
+                                                onClick={() => {
+                                                  const revOrigIdx = getMatchedOriginalIndex(idx, originalSentences, simplifiedSentences);
+                                                  setHoveredOrigIdx(revOrigIdx);
+                                                }}
+                                                onMouseEnter={() => {
+                                                  const revOrigIdx = getMatchedOriginalIndex(idx, originalSentences, simplifiedSentences);
+                                                  setHoveredOrigIdx(revOrigIdx);
+                                                }}
+                                                className={`p-2.5 rounded-lg border transition-all duration-150 cursor-pointer text-xs leading-relaxed ${
+                                                  isSelected
+                                                    ? "bg-green-50 border-green-300 text-green-950 font-medium shadow-xs ring-2 ring-green-400/10"
+                                                    : "border-slate-100 text-slate-500 hover:bg-slate-50 hover:text-slate-800 opacity-65 hover:opacity-100"
+                                                }`}
+                                              >
+                                                <div className="flex items-start gap-2">
+                                                  <span className={`text-[8px] font-bold px-1 py-0.2 rounded-sm mt-0.5 shrink-0 select-none ${
+                                                    isSelected ? "bg-green-200 text-green-800" : "bg-slate-200 text-slate-600"
+                                                  }`}>
+                                                    {idx + 1}
+                                                  </span>
+                                                  <div className="grow select-text">
+                                                    {sent}
+                                                  </div>
+                                                </div>
+                                              </div>
+                                            );
+                                          })
+                                        )}
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  {/* Comparison Insights Bento Box */}
+                                  {activeOriginalSentence && (
+                                    <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3.5 shadow-sm" id="overlay_insights_panel">
+                                      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 pb-2.5">
+                                        <h5 className="text-xs font-extrabold text-slate-700 uppercase tracking-wider flex items-center gap-1.5 leading-none m-0">
+                                          <FileCheck size={14} className="text-gov-accent" />
+                                          Section Translation Insights
+                                        </h5>
+                                        <div className="flex items-center gap-1">
+                                          <span className="text-[10px] font-bold text-red-805 bg-red-50 border border-red-100 px-2.5 py-0.5 rounded-full">
+                                            Legalese Clause #{hoveredOrigIdx + 1}
+                                          </span>
+                                          <ArrowRight size={12} className="text-slate-400" />
+                                          <span className="text-[10px] font-bold text-green-805 bg-green-50 border border-green-100 px-2.5 py-0.5 rounded-full">
+                                            Plain Alternative #{matchedSimpIndex + 1}
+                                          </span>
+                                        </div>
+                                      </div>
+
+                                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                                        {/* Stat metrics */}
+                                        <div className="bg-white p-3.5 rounded-lg border border-slate-200 flex flex-col justify-center items-center text-center shadow-2xs">
+                                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Clause Length Reduction</span>
+                                          <div className="flex items-baseline gap-1 mt-1 font-sans">
+                                            {(() => {
+                                              const origLen = activeOriginalSentence.split(/\s+/).filter(Boolean).length;
+                                              const simpLen = activeSimplifiedSentence ? activeSimplifiedSentence.split(/\s+/).filter(Boolean).length : 0;
+                                              const pct = origLen > 0 ? Math.max(0, Math.round(((origLen - simpLen) / origLen) * 100)) : 0;
+                                              return (
+                                                <>
+                                                  <span className="text-xl font-black text-slate-800">
+                                                    {pct}%
+                                                  </span>
+                                                  <span className="text-[9px] text-green-600 font-bold font-mono">Shorter</span>
+                                                </>
+                                              );
+                                            })()}
+                                          </div>
+                                          <p className="text-[9px] text-slate-500 mt-1 leading-none">
+                                            {activeOriginalSentence.split(/\s+/).filter(Boolean).length} words ➔ {activeSimplifiedSentence ? activeSimplifiedSentence.split(/\s+/).filter(Boolean).length : 0} words
+                                          </p>
+                                        </div>
+
+                                        {/* Visual Bar Comparison */}
+                                        <div className="bg-white p-3.5 rounded-lg border border-slate-200 flex flex-col justify-center shadow-2xs">
+                                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 text-center mb-1 bg-slate-50 py-0.5 rounded">Structure Complexity</span>
+                                          <div className="space-y-2 mt-1">
+                                            {(() => {
+                                              const origLen = activeOriginalSentence.split(/\s+/).filter(Boolean).length;
+                                              const simpLen = activeSimplifiedSentence ? activeSimplifiedSentence.split(/\s+/).filter(Boolean).length : 0;
+                                              const ratio = origLen > 0 ? Math.min(100, Math.round((simpLen / origLen) * 100)) : 25;
+                                              return (
+                                                <>
+                                                  <div>
+                                                    <div className="flex justify-between text-[8px] font-bold text-slate-500 mb-0.5">
+                                                      <span>Original Legalese</span>
+                                                      <span className="text-red-700">Complex (100%)</span>
+                                                    </div>
+                                                    <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
+                                                      <div className="bg-red-500 h-full rounded-full" style={{ width: "100%" }}></div>
+                                                    </div>
+                                                  </div>
+                                                  <div>
+                                                    <div className="flex justify-between text-[8px] font-bold text-slate-500 mb-0.5">
+                                                      <span>Citizen Version</span>
+                                                      <span className="text-green-700">Clear ({ratio}%)</span>
+                                                    </div>
+                                                    <div className="w-full bg-slate-105 h-1.5 rounded-full overflow-hidden">
+                                                      <div className="bg-green-500 h-full rounded-full" style={{ width: `${ratio}%` }}></div>
+                                                    </div>
+                                                  </div>
+                                                </>
+                                              );
+                                            })()}
+                                          </div>
+                                        </div>
+
+                                        {/* Term Decryption Badge board */}
+                                        <div className="bg-white p-3.5 rounded-lg border border-slate-200 flex flex-col justify-between shadow-2xs">
+                                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Jargon Unlocked</span>
+                                          <div className="flex flex-wrap gap-1 mt-1.5 grow max-h-[55px] overflow-y-auto custom-scrollbar">
+                                            {(() => {
+                                              const termsFound = (currentResult.glossary || []).filter(item => {
+                                                if (!item.term) return false;
+                                                const escaped = item.term.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+                                                const regex = new RegExp(escaped, 'i');
+                                                return regex.test(activeOriginalSentence);
+                                              });
+
+                                              if (termsFound.length === 0) {
+                                                return (
+                                                  <p className="text-[9px] text-slate-400 italic">No formal vocabulary terms matched in this single clause.</p>
+                                                );
+                                              }
+
+                                              return termsFound.map((item, keyIdx) => (
+                                                <span
+                                                  key={keyIdx}
+                                                  className="text-[9px] font-semibold bg-amber-50 text-amber-800 border border-amber-200 px-1.5 py-0.5 rounded cursor-help"
+                                                  title={`${item.term}: ${item.definition}`}
+                                                >
+                                                  {item.term}
+                                                </span>
+                                              ));
+                                            })()}
+                                          </div>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })()
                           ) : (
                             /* Bilingual Simplification Cards in grid stack */
                             <div className={`grid grid-cols-1 ${selectedLang === "en" ? "" : "md:grid-cols-2"} gap-6`} id="bilingual_output_grid">
@@ -1910,6 +2345,105 @@ try {
           >
             <X size={14} />
           </button>
+        </div>
+      )}
+
+      {/* CITIZEN PRINT DOCUMENT FOR OVERLAY COMPARISON MODE */}
+      {currentResult && (
+        <div id="citizen-print-overlay-document" className="hidden print:block p-8 max-w-4xl mx-auto bg-white text-slate-900 font-sans">
+          <div className="border-b border-slate-300 pb-4 mb-6">
+            <div className="flex justify-between items-start">
+              <div>
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Official Simplification Study</span>
+                <h1 className="text-xl font-bold text-slate-900 mt-0.5">{currentResult.title || "Regulatory Circular"}</h1>
+                <p className="text-xs text-slate-500 mt-1">
+                  Processed: {new Date(currentResult.timestamp).toLocaleDateString()} at {new Date(currentResult.timestamp).toLocaleTimeString()}
+                </p>
+              </div>
+              <div className="text-right">
+                <span className="text-xs font-bold text-slate-700 bg-slate-100 border border-slate-200 px-2 py-1 rounded">
+                  Language Dialect: {selectedLang === "te" ? "Telugu (తెలుగు)" : selectedLang === "hi" ? "Hindi (हिन्दी)" : "English (Simplified)"}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* Section 1: Executive Summary */}
+          <div className="mb-6">
+            <h3 className="text-sm font-bold text-slate-700 uppercase tracking-wider mb-2">Executive Summary</h3>
+            <p className="text-xs text-slate-800 bg-slate-50 border border-slate-200 p-3 rounded leading-relaxed italic">
+              {currentResult.summary}
+            </p>
+          </div>
+
+          {/* Section 2: Side-by-Side Clause Alignment */}
+          <div>
+            <h3 className="text-sm font-bold text-slate-700 uppercase tracking-wider mb-4 border-b border-slate-200 pb-1.5">
+              Detailed Clause Comparison
+            </h3>
+            <div className="space-y-4">
+              {(() => {
+                const originalSentences = splitIntoSentences(currentResult.originalText);
+                const activeSimplifiedText = selectedLang === "te" 
+                  ? currentResult.teluguTranslation 
+                  : selectedLang === "hi" 
+                    ? currentResult.hindiTranslation 
+                    : currentResult.simplifiedEnglish;
+                const simplifiedSentences = splitIntoSentences(activeSimplifiedText);
+
+                return originalSentences.map((orig, i) => {
+                  const simpIdx = getMatchedSimplifiedIndex(i, originalSentences, simplifiedSentences);
+                  const simp = simplifiedSentences[simpIdx] || "(No direct translation found)";
+                  return (
+                    <div key={i} className="grid grid-cols-2 gap-6 border-b border-slate-100 pb-4 last:border-0 page-break-inside-avoid">
+                      <div className="text-xs text-slate-800 leading-relaxed pr-2">
+                        <div className="font-bold text-red-800 mb-1 flex items-center gap-1.5 font-mono">
+                          <span className="w-4 h-4 bg-red-100 rounded-sm flex items-center justify-center text-[10px]">
+                            {i + 1}
+                          </span>
+                          ORIGINAL LEGALESE
+                        </div>
+                        <p className="whitespace-pre-line leading-relaxed">{orig.trim()}</p>
+                      </div>
+                      <div className="text-xs text-slate-900 leading-relaxed pl-2 border-l border-slate-200">
+                        <div className="font-bold text-green-800 mb-1 flex items-center gap-1.5 font-mono">
+                          <span className="w-4 h-4 bg-green-100 rounded-sm flex items-center justify-center text-[10px]">
+                            {i + 1}
+                          </span>
+                          CITIZEN TRANSFORMATION
+                        </div>
+                        <p className="whitespace-pre-line leading-relaxed">{simp.trim()}</p>
+                      </div>
+                    </div>
+                  );
+                });
+              })()}
+            </div>
+          </div>
+
+          {/* Glossary section */}
+          {currentResult.glossary && currentResult.glossary.length > 0 && (
+            <div className="mt-8 pt-6 border-t border-slate-200 page-break-inside-avoid">
+              <h3 className="text-sm font-bold text-slate-700 uppercase tracking-wider mb-3">
+                Jargon Encyclopedia (Indian Legal Terminology)
+              </h3>
+              <dl className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                {currentResult.glossary.map((item, idx) => (
+                  <div key={idx} className="text-xs leading-relaxed">
+                    <dt className="font-bold text-slate-800 mb-0.5">{item.term}</dt>
+                    <dd className="text-slate-600">{item.definition}</dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          )}
+
+          {/* Footer watermark */}
+          <div className="mt-12 border-t border-slate-200 pt-3 text-center">
+            <p className="text-[10px] text-slate-400">
+              Digitally Simplified & Translated by Indian Citizen Legislation simplifying portal.
+            </p>
+          </div>
         </div>
       )}
     </div>

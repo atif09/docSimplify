@@ -80,3 +80,37 @@ body {
 .gov-gradient-top {
   border-top: 4px solid #B7791F;
 }
+
+/* Print Specific High-Contrast Stylesheet */
+@media print {
+  /* Set entire screen elements invisible */
+  body * {
+    visibility: hidden;
+  }
+  
+  /* Make only the print container and its contents visible */
+  #citizen-print-overlay-document,
+  #citizen-print-overlay-document * {
+    visibility: visible;
+  }
+  
+  /* Position target element cleanly at the top of the physical page */
+  #citizen-print-overlay-document {
+    visibility: visible !important;
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    display: block !important;
+    background-color: white !important;
+    color: black !important;
+  }
+
+  /* Prevent split comparative items from breaking across page boundaries */
+  .page-break-inside-avoid {
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+  }
+}
