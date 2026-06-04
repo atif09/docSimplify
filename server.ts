@@ -7,7 +7,6 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import Groq from "groq-sdk";
-import Tesseract from "tesseract.js";
 import dotenv from "dotenv";
 
 // Load environment variables
@@ -150,47 +149,62 @@ async function extractTextFromFile(fileData: string, mimeType: string): Promise<
       return data.text;
     }
 
-    // Scanned PDF: render each page to an image, then OCR
-    console.log("[DocSimplify] Scanned PDF detected — falling back to page rendering + OCR...");
-    const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs" as any);
-    const { createCanvas } = await import("@napi-rs/canvas");
-
-    const lib = (pdfjsLib as any).default ?? pdfjsLib;
-    // Point to the worker file using an absolute file:// URL so Node.js worker_threads can load it
-    const workerPath = path.resolve(process.cwd(), "node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs");
-    lib.GlobalWorkerOptions.workerSrc = `file://${workerPath}`;
-
-    const pdfDoc = await lib.getDocument({ data: new Uint8Array(buffer), verbosity: 0 }).promise;
-    const pageCount = Math.min(pdfDoc.numPages, 10); // cap at 10 pages
+    // Scanned PDF: render each page to PNG via mupdf, then OCR with Groq vision
+    console.log("[DocSimplify] Scanned PDF detected — rendering pages for vision OCR...");
+    // @ts-ignore - mupdf types may not be available
+    const mupdf = await import("mupdf");
+    const pdf = mupdf.Document.openDocument(new Uint8Array(buffer), "application/pdf");
+    const pageCount = Math.min(pdf.countPages(), 10);
     let fullText = "";
 
-    for (let i = 1; i <= pageCount; i++) {
-      const page = await pdfDoc.getPage(i);
-      const viewport = page.getViewport({ scale: 2.0 }); // scale 2x for better OCR accuracy
-      const canvas = createCanvas(viewport.width, viewport.height);
-      const context = canvas.getContext("2d");
+    const groq = getGroqClient();
+    for (let i = 0; i < pageCount; i++) {
+      const page = pdf.loadPage(i);
+      const pixmap = page.toPixmap(mupdf.Matrix.scale(2, 2), mupdf.ColorSpace.DeviceRGB);
+      const pngBase64 = Buffer.from(pixmap.asPNG()).toString("base64");
 
-      await page.render({ canvasContext: context as any, viewport }).promise;
+      const response = await groq.chat.completions.create({
+        model: "meta-llama/llama-4-scout-17b-16e-instruct",
+        messages: [{
+          role: "user",
+          content: [
+            { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64}` } },
+            { type: "text", text: "Extract all text from this document page. Return only the extracted text, preserving the original language. The document may be in English, Hindi, or Telugu." }
+          ]
+        }],
+        max_tokens: 4000
+      });
 
-      const imgBuffer = canvas.toBuffer("image/png");
-      const result = await Tesseract.recognize(imgBuffer, "eng+hin+tel", {
-        cachePath: "/tmp"
-      } as any);
-
-      fullText += result.data.text + "\n";
+      fullText += (response.choices[0].message.content || "") + "\n";
     }
 
     if (!fullText.trim()) {
       throw new Error("Could not extract any text from this PDF. Try uploading as a JPG or PNG instead.");
     }
-
     return fullText;
 
   } else if (mimeType.startsWith("image/")) {
-    const result = await Tesseract.recognize(buffer, "eng+hin+tel", {
-      cachePath: "/tmp"
-    } as any);
-    return result.data.text;
+    // Use Groq vision to extract text from the image
+    const groq = getGroqClient();
+    const response = await groq.chat.completions.create({
+      model: "meta-llama/llama-4-scout-17b-16e-instruct",
+      messages: [{
+        role: "user",
+        content: [
+          {
+            type: "image_url",
+            image_url: { url: `data:${mimeType};base64,${fileData}` }
+          },
+          {
+            type: "text",
+            text: "Extract all text from this document image. Return only the extracted text, preserving the original language and layout. The document may be in English, Hindi, or Telugu."
+          }
+        ]
+      }],
+      max_tokens: 4000
+    });
+    return response.choices[0].message.content || "";
+
   } else {
     // TXT or other text formats: decode base64 directly
     return buffer.toString("utf-8");
