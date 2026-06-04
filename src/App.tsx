@@ -71,6 +71,7 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [progressStep, setProgressStep] = useState<string>("");
   const [errorMsg, setErrorMsg] = useState<string>("");
+  const [isLocked, setIsLocked] = useState<boolean>(false);
   const [currentResult, setCurrentResult] = useState<SimplifiedResult | null>(null);
 
   // History states
@@ -220,6 +221,7 @@ export default function App() {
     const isTextFile = file.type === "text/plain" || file.name.endsWith(".txt");
     const isImageFile = file.type.startsWith("image/");
     setErrorMsg("");
+    setIsLocked(false);
 
     if (isTextFile) {
       const reader = new FileReader();
@@ -373,6 +375,7 @@ export default function App() {
         try {
           const errData = await response.json();
           errMsg = errData.error || errMsg;
+          if (errData.locked) setIsLocked(true);
         } catch (jsonErr) {
           try {
             const rawText = await response.text();
@@ -1208,9 +1211,10 @@ export default function App() {
                       <button
                         id="process-simplifier-btn"
                         onClick={handleSimplifyDocument}
-                        className="mt-4 w-full py-3 bg-gov-primary hover:bg-slate-800 text-white font-extrabold text-xs tracking-wider uppercase rounded-lg shadow flex items-center justify-center gap-1.5 cursor-pointer hover:shadow-md transition duration-150"
+                        disabled={isLocked}
+                        className={`mt-4 w-full py-3 text-white font-extrabold text-xs tracking-wider uppercase rounded-lg shadow flex items-center justify-center gap-1.5 transition duration-150 ${isLocked ? "bg-red-700 cursor-not-allowed opacity-70" : "bg-gov-primary hover:bg-slate-800 cursor-pointer hover:shadow-md"}`}
                       >
-                        Execute NLP Simplify
+                        {isLocked ? "Upload Blocked — Invalid Document" : "Execute NLP Simplify"}
                         <ChevronRight size={14} />
                       </button>
                     </div>
