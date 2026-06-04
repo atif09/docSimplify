@@ -515,27 +515,20 @@ Ensure Telugu and Hindi texts are fully translated and returned in elegant unico
     const userData = getUserData(db, email);
     const existingScore = userData.trustScore || 100;
 
-    // Non-government content — images get locked (no score change), PDFs/text get -10
+    // Non-government document — deduct 10, clamped to [0, 100]; lock when score hits 0
     if (docuDetails.isGovernmentRelated === false || !docuDetails.isGovernmentRelated) {
-      const isImage = mimeType && (mimeType as string).startsWith("image/");
-      if (isImage) {
-        return res.status(400).json({
-          error: "This image does not appear to be a government document. Please upload an official government document.",
-          locked: true,
-          trustScore: existingScore
-        });
-      }
-      const newScore = Math.max(10, Math.min(100, existingScore - 10));
+      const newScore = Math.max(0, Math.min(100, existingScore - 10));
       userData.trustScore = newScore;
       saveDb(db);
       return res.status(400).json({
         error: "Failed to translate because the uploaded document is not government-related",
+        locked: newScore === 0,
         trustScore: newScore
       });
     }
 
-    // Government document — +5, clamped to [10, 100]
-    const newScore = Math.max(10, Math.min(100, existingScore + 5));
+    // Government document — +5, clamped to [0, 100]
+    const newScore = Math.max(0, Math.min(100, existingScore + 5));
     userData.trustScore = newScore;
 
     const newDocItem = {

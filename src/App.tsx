@@ -43,6 +43,43 @@ import WelcomeHero from "./components/WelcomeHero";
 import AuthPortal from "./components/AuthPortal";
 import { SimplifiedResult, UserProfile, GlossaryItem } from "./types";
 
+function showPenaltyToast(score: number) {
+  const existing = document.getElementById("__penalty_toast__");
+  if (existing) existing.remove();
+
+  const toast = document.createElement("div");
+  toast.id = "__penalty_toast__";
+  toast.style.cssText = [
+    "position:fixed", "bottom:24px", "right:24px", "z-index:999999",
+    "width:320px", "background:#0f172a", "border:1px solid rgba(234,179,8,0.35)",
+    "border-radius:12px", "overflow:hidden",
+    "box-shadow:0 25px 50px -12px rgba(0,0,0,0.6)",
+    "font-family:sans-serif"
+  ].join(";");
+
+  toast.innerHTML = `
+    <div style="height:3px;background:#d97706;width:100%"></div>
+    <div style="padding:14px 14px 14px 14px;display:flex;gap:10px;align-items:flex-start;">
+      <div style="flex-shrink:0;margin-top:2px;width:28px;height:28px;border-radius:50%;background:rgba(245,158,11,0.12);border:1px dashed rgba(245,158,11,0.4);display:flex;align-items:center;justify-content:center;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      </div>
+      <div style="flex:1;min-width:0;">
+        <p style="margin:0 0 2px;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:0.1em;color:#f59e0b;">Integrity Warning</p>
+        <p style="margin:0 0 4px;font-size:12px;font-weight:700;color:#fff;">Trust Score Decreased to ${score}/100</p>
+        <p style="margin:0;font-size:11px;color:#94a3b8;line-height:1.5;">Non-government document submitted. Continued violations will result in permanent access block.</p>
+      </div>
+      <button id="__penalty_toast_close__" style="flex-shrink:0;background:none;border:none;cursor:pointer;color:#475569;font-size:18px;line-height:1;padding:0;">&#x2715;</button>
+    </div>
+  `;
+
+  document.body.appendChild(toast);
+  const timer = setTimeout(() => toast.remove(), 20000);
+  document.getElementById("__penalty_toast_close__")?.addEventListener("click", () => {
+    clearTimeout(timer);
+    toast.remove();
+  });
+}
+
 export default function App() {
   // Navigation & User session states
   const [activeTab, setActiveTab] = useState<string>("home");
@@ -72,12 +109,13 @@ export default function App() {
   const [progressStep, setProgressStep] = useState<string>("");
   const [errorMsg, setErrorMsg] = useState<string>("");
   const [isLocked, setIsLocked] = useState<boolean>(false);
+  const [warningScore, setWarningScore] = useState<number>(100);
   const [currentResult, setCurrentResult] = useState<SimplifiedResult | null>(null);
 
   // History states
   const [historyList, setHistoryList] = useState<SimplifiedResult[]>([]);
   const [savedList, setSavedList] = useState<SimplifiedResult[]>([]);
-  const [portalTrustScore, setPortalTrustScore] = useState<number>(85);
+  const [portalTrustScore, setPortalTrustScore] = useState<number>(100);
 
   // Contact US Form States
   const [contactForm, setContactForm] = useState({ name: "", email: "", idCode: "", message: "" });
@@ -221,7 +259,7 @@ export default function App() {
     const isTextFile = file.type === "text/plain" || file.name.endsWith(".txt");
     const isImageFile = file.type.startsWith("image/");
     setErrorMsg("");
-    setIsLocked(false);
+    if (portalTrustScore > 0) setIsLocked(false);
 
     if (isTextFile) {
       const reader = new FileReader();
@@ -376,6 +414,17 @@ export default function App() {
           const errData = await response.json();
           errMsg = errData.error || errMsg;
           if (errData.locked) setIsLocked(true);
+          if (errData.trustScore !== undefined) {
+            const newScore = errData.trustScore;
+            setWarningScore(newScore);
+            setPortalTrustScore(newScore);
+            showPenaltyToast(newScore);
+            if (user) {
+              const updatedUser = { ...user, trustScore: newScore };
+              setUser(updatedUser);
+              localStorage.setItem("docuease_user", JSON.stringify(updatedUser));
+            }
+          }
         } catch (jsonErr) {
           try {
             const rawText = await response.text();
@@ -484,7 +533,7 @@ export default function App() {
       setHistoryList([]);
       setSavedList([]);
       setCurrentResult(null);
-      setPortalTrustScore(85);
+      setPortalTrustScore(100);
       
       const cachedUser = localStorage.getItem("docuease_user");
       if (cachedUser) {
@@ -496,7 +545,7 @@ export default function App() {
     } catch (e) {
       setHistoryList([]);
       setSavedList([]);
-      setPortalTrustScore(85);
+      setPortalTrustScore(100);
     }
   };
 
@@ -856,7 +905,7 @@ export default function App() {
   const handleLogout = () => {
     localStorage.removeItem("docuease_user");
     setUser(null);
-    setPortalTrustScore(85);
+    setPortalTrustScore(100);
     setHistoryList([]);
     setSavedList([]);
     setCurrentResult(null);
@@ -977,6 +1026,7 @@ export default function App() {
             </div>
           </div>
         )}
+
 
         {/* Dynamic Workspace based on current Selected Navigation Link */}
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -1211,10 +1261,10 @@ export default function App() {
                       <button
                         id="process-simplifier-btn"
                         onClick={handleSimplifyDocument}
-                        disabled={isLocked}
-                        className={`mt-4 w-full py-3 text-white font-extrabold text-xs tracking-wider uppercase rounded-lg shadow flex items-center justify-center gap-1.5 transition duration-150 ${isLocked ? "bg-red-700 cursor-not-allowed opacity-70" : "bg-gov-primary hover:bg-slate-800 cursor-pointer hover:shadow-md"}`}
+                        disabled={isLocked || portalTrustScore === 0}
+                        className={`mt-4 w-full py-3 text-white font-extrabold text-xs tracking-wider uppercase rounded-lg shadow flex items-center justify-center gap-1.5 transition duration-150 ${(isLocked || portalTrustScore === 0) ? "bg-red-700 cursor-not-allowed opacity-70" : "bg-gov-primary hover:bg-slate-800 cursor-pointer hover:shadow-md"}`}
                       >
-                        {isLocked ? "Upload Blocked — Invalid Document" : "Execute NLP Simplify"}
+                        {portalTrustScore === 0 ? "Access Revoked — Trust Score at 0" : isLocked ? "Upload Blocked — Invalid Document" : "Execute NLP Simplify"}
                         <ChevronRight size={14} />
                       </button>
                     </div>
