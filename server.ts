@@ -6,7 +6,8 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { GoogleGenAI, Type } from "@google/genai";
+import Groq from "groq-sdk";
+import Tesseract from "tesseract.js";
 import dotenv from "dotenv";
 
 // Load environment variables
@@ -49,7 +50,7 @@ interface DbStructure {
 
 const DEFAULT_DB: DbStructure = {
   users: {},
-  trustScore: 85,
+  trustScore: 60,
   history: [],
   saved: [],
   userProfile: {
@@ -105,7 +106,7 @@ function getUserData(db: any, email: string): UserData {
   
   if (!db.users[normEmail]) {
     db.users[normEmail] = {
-      trustScore: 85,
+      trustScore: 60,
       history: [],
       saved: []
     };
@@ -122,78 +123,78 @@ function saveDb(data: DbStructure) {
   }
 }
 
-// Lazy initialization of Gemini client
-let geminiClient: GoogleGenAI | null = null;
-function getGeminiClient(): GoogleGenAI {
-  if (!geminiClient) {
-    const key = process.env.GEMINI_API_KEY;
-    if (!key || key === "MY_GEMINI_API_KEY") {
-      throw new Error("GEMINI_API_KEY is not configured in Secrets. Please define it in your environment.");
+// Lazy initialization of Groq client
+let groqClient: Groq | null = null;
+function getGroqClient(): Groq {
+  if (!groqClient) {
+    const key = process.env.GROQ_API_KEY;
+    if (!key) {
+      throw new Error("GROQ_API_KEY is not configured in Secrets.");
     }
-    geminiClient = new GoogleGenAI({
-      apiKey: key,
-      httpOptions: {
-        headers: {
-          "User-Agent": "aistudio-build",
-        }
-      }
-    });
+    groqClient = new Groq({ apiKey: key });
   }
-  return geminiClient;
+  return groqClient;
 }
 
-// Robust fallback wrapper with Exponential Backoff for 503 errors and Model fallbacks
-async function generateContentWithFallback(ai: GoogleGenAI, params: { contents: any; config: any }) {
-  const models = ["gemini-2.0-flash", "gemini-2.0-flash-lite"];
-  let lastError: any = null;
+// Extract plain text from a base64-encoded file using local libraries
+async function extractTextFromFile(fileData: string, mimeType: string): Promise<string> {
+  const buffer = Buffer.from(fileData, "base64");
 
-  for (const modelName of models) {
-    let retries = 4;
-    let delay = 800;
+  if (mimeType === "application/pdf") {
+    // @ts-ignore - pdf-parse has no TypeScript declarations
+    const { default: pdfParse } = await import("pdf-parse");
+    const data = await pdfParse(buffer);
 
-    while (retries > 0) {
-      try {
-        console.log(`[Gemini API] Querying model: ${modelName} (${retries} attempts remaining)...`);
-        const response = await ai.models.generateContent({
-          model: modelName,
-          contents: params.contents,
-          config: params.config,
-        });
-        if (response) {
-          console.log(`[Gemini API] Successfully generated content using model: ${modelName}`);
-          return response;
-         }
-      } catch (error: any) {
-        lastError = error;
-        const errStr = String(error?.message || error?.status || error || "").toLowerCase();
-
-        const isTransient =
-          errStr.includes("503") ||
-          errStr.includes("unavailable") ||
-          errStr.includes("high demand") ||
-          errStr.includes("resource_exhausted") ||
-          errStr.includes("429") ||
-          errStr.includes("rate limit") ||
-          errStr.includes("temp");
-
-        if (isTransient && retries > 1) {
-          // Add random jitter to mitigate concurrent client retries
-          const jitter = Math.floor(Math.random() * 400) - 200;
-          const finalDelay = Math.max(200, delay + jitter);
-          console.log(`[Gemini API] Model ${modelName} is busy (demand spike detected). Recalibrating request in ${finalDelay}ms...`);
-          await new Promise((resolve) => setTimeout(resolve, finalDelay));
-          delay *= 1.8;
-          retries--;
-        } else {
-          // Not transient or no retries left; continue to try the next model configuration
-          console.log(`[Gemini API] Model ${modelName} transitioned. Moving to backup models for complete delivery.`);
-          break;
-        }
-      }
+    // Text-based PDF: use embedded text directly
+    if (data.text.trim().length >= 50) {
+      return data.text;
     }
-  }
 
-  throw lastError || new Error("All designated generative model configurations returned error.");
+    // Scanned PDF: render each page to an image, then OCR
+    console.log("[DocSimplify] Scanned PDF detected — falling back to page rendering + OCR...");
+    const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs" as any);
+    const { createCanvas } = await import("@napi-rs/canvas");
+
+    const lib = (pdfjsLib as any).default ?? pdfjsLib;
+    // Point to the worker file using an absolute file:// URL so Node.js worker_threads can load it
+    const workerPath = path.resolve(process.cwd(), "node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs");
+    lib.GlobalWorkerOptions.workerSrc = `file://${workerPath}`;
+
+    const pdfDoc = await lib.getDocument({ data: new Uint8Array(buffer), verbosity: 0 }).promise;
+    const pageCount = Math.min(pdfDoc.numPages, 10); // cap at 10 pages
+    let fullText = "";
+
+    for (let i = 1; i <= pageCount; i++) {
+      const page = await pdfDoc.getPage(i);
+      const viewport = page.getViewport({ scale: 2.0 }); // scale 2x for better OCR accuracy
+      const canvas = createCanvas(viewport.width, viewport.height);
+      const context = canvas.getContext("2d");
+
+      await page.render({ canvasContext: context as any, viewport }).promise;
+
+      const imgBuffer = canvas.toBuffer("image/png");
+      const result = await Tesseract.recognize(imgBuffer, "eng+hin+tel", {
+        cachePath: "/tmp"
+      } as any);
+
+      fullText += result.data.text + "\n";
+    }
+
+    if (!fullText.trim()) {
+      throw new Error("Could not extract any text from this PDF. Try uploading as a JPG or PNG instead.");
+    }
+
+    return fullText;
+
+  } else if (mimeType.startsWith("image/")) {
+    const result = await Tesseract.recognize(buffer, "eng+hin+tel", {
+      cachePath: "/tmp"
+    } as any);
+    return result.data.text;
+  } else {
+    // TXT or other text formats: decode base64 directly
+    return buffer.toString("utf-8");
+  }
 }
 
 // Ensure database file is initialized
@@ -253,7 +254,7 @@ app.post("/api/register", (req, res) => {
   }
   
   db.users[normEmail] = {
-    trustScore: 85,
+    trustScore: 60,
     history: [],
     saved: [],
     displayName: displayName || "John Doe",
@@ -267,7 +268,7 @@ app.post("/api/register", (req, res) => {
     profile: {
       email: normEmail,
       displayName: db.users[normEmail].displayName,
-      trustScore: 85,
+      trustScore: 60,
       isLoggedIn: true
     }
   });
@@ -331,7 +332,7 @@ app.post("/api/login", (req, res) => {
       .join(" ") || "Citizen User";
       
     db.users[normEmail] = {
-      trustScore: 85,
+      trustScore: 60,
       history: [],
       saved: [],
       displayName: computedName,
@@ -408,9 +409,9 @@ app.post("/api/history/clear", (req, res) => {
   const userData = getUserData(db, email);
   userData.history = [];
   userData.saved = [];
-  userData.trustScore = 85; // reset of trust score index
+  userData.trustScore = 60; // reset of trust score index
   saveDb(db);
-  res.json({ status: "success", history: [], saved: [], trustScore: 85 });
+  res.json({ status: "success", history: [], saved: [], trustScore: 60 });
 });
 
 // 4. Document processing (Manual Paste Text or PDF/Image Base64 extraction)
@@ -423,39 +424,34 @@ app.post("/api/process", async (req, res) => {
   }
 
   try {
-    const ai = getGeminiClient();
+    const groq = getGroqClient();
 
-    let inputSourcePrompt = "";
-    let parts: any[] = [];
     const detectedSourceLang = sourceLang || "en";
     const sourceLangText = detectedSourceLang === "te" ? "Telugu" : detectedSourceLang === "hi" ? "Hindi" : "English";
 
-    // If base64 file data is provided, append it to Gemini contents array so it can perform multimodal OCR/parsing
+    // Extract text from file if provided, otherwise use pasted text
+    let documentText = text || "";
     if (fileData && mimeType) {
-      parts.push({
-        inlineData: {
-          data: fileData,
-          mimeType: mimeType
-        }
-      });
-      inputSourcePrompt = `Analyze, OCR-extract, parse, translate, and simplify the attached document (named: "${fileName || 'document'}", mimeType: "${mimeType}"). The document's configured source language hint is: ${sourceLangText}. However, the document may be written in English, Telugu, Hindi, or a mix of any of these languages. Please dynamically detect the actual language(s) used and parse/OCR the contents appropriately.`;
-    } else {
-      parts.push({
-        text: `Here is the pasted text of the document to analyze: \n\n${text}`
-      });
-      inputSourcePrompt = `Analyze, translate, and simplify the following legal/official text. The document's configured source language hint is: ${sourceLangText}. However, the text may be written in English, Telugu, Hindi, or a mix of any of these languages. Please dynamically detect the actual language(s) used and translate/simplify appropriately.`;
+      console.log(`[DocSimplify] Extracting text from file: ${fileName || "document"} (${mimeType})`);
+      documentText = await extractTextFromFile(fileData, mimeType);
+      console.log(`[DocSimplify] Extracted ${documentText.length} characters from file.`);
     }
 
-    // Append system architectural rules with structured schemas
+    const inputSourcePrompt = fileData && mimeType
+      ? `Analyze, translate, and simplify the following text extracted from a document (named: "${fileName || 'document'}", mimeType: "${mimeType}"). Source language hint: ${sourceLangText}. The text may be in English, Telugu, Hindi, or a mix — detect and process accordingly.`
+      : `Analyze, translate, and simplify the following legal/official text. Source language hint: ${sourceLangText}. The text may be in English, Telugu, Hindi, or a mix — detect and process accordingly.`;
+
     const finalPrompt = `
 ${inputSourcePrompt}
+
+Document text:
+${documentText}
 
 You are acting as an expert Government NLP Architect, Judiciary Translation Specialist, and Universal Citizen Advocate.
 Your mission is to perform these operations:
 1. Classification & Verification:
    - Detect whether the content is related to an official Indian government, legal matter, public utility, municipal sector, welfare program, state/central notification, judicial filing, or relevant public policy issue in India. Set "isGovernmentRelated" to true if so, otherwise false.
    - Categorize the exact "documentType", picking from or describing similar official genres: e.g., "Government Order", "Circular", "Welfare Scheme", "Tax & Customs Notice", "Judiciary Brief", "Public Notice", "Advisory", or "General Policy Brief".
-   - Determine "trustScoreImpact". If it is highly related to government policies, notifications, or welfare schemes, set the impact to positive (between +3 to +5). If the document is completely unrelated, personal chat, spam, or nonsense, set it to negative (between -5 and -10). If it contains some relevant context or is partial, set it to 0 or +1.
 2. Simplification & Metadata Generation:
    - Give the document a standard human-readable, respectful "title" (e.g. "Pradhan Mantri Awas Yojana Guideline", "MCD Circular on Taxation").
    - Extract a 1-sentence "summary" of the document.
@@ -466,56 +462,30 @@ Your mission is to perform these operations:
 4. Glossary Generation:
    - Extract up to 6 complex legal, financial, or bureaucratic terms appearing in the document (mapped to their English terms if written in regional scripts or translated) and map each to a simple, plain-language explanation in "glossary" (term & definition).
 
-Response Schema Constraints:
-Your return message MUST strictly fulfill the JSON structure outlined in the configuration responseSchema. Ensure Telugu and Hindi texts are fully translated and returned in elegant unicode scripts without abbreviations or raw numbers where plain translations are appropriate. Set proper trustScoreImpact based on the actual relevance of the input content.
+Return ONLY valid JSON with exactly these fields:
+{
+  "isGovernmentRelated": boolean,
+  "documentType": string,
+  "title": string,
+  "summary": string,
+  "simplifiedEnglish": string,
+  "teluguTranslation": string,
+  "hindiTranslation": string,
+  "glossary": [{"term": string, "definition": string}]
+}
+
+Ensure Telugu and Hindi texts are fully translated and returned in elegant unicode scripts.
 `;
 
-    parts.push({ text: finalPrompt });
-
-    const modelResponse = await generateContentWithFallback(ai, {
-      contents: { parts: parts },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            isGovernmentRelated: { type: Type.BOOLEAN, description: "Whether the document is official/governmental/public-service oriented" },
-            documentType: { type: Type.STRING, description: "Classification genre of the document" },
-            trustScoreImpact: { type: Type.INTEGER, description: "Change score for trust (-10 to +5)" },
-            title: { type: Type.STRING, description: "Clean, institutional title for this document" },
-            summary: { type: Type.STRING, description: "One-sentence high-level summary" },
-            simplifiedEnglish: { type: Type.STRING, description: "Plain simple-English interpretation of the core provisions" },
-            teluguTranslation: { type: Type.STRING, description: "High-quality simplified Telugu translation of the simplified English" },
-            hindiTranslation: { type: Type.STRING, description: "High-quality simplified Hindi translation of the simplified English" },
-            glossary: {
-              type: Type.ARRAY,
-              description: "Array of complex terms with their plain-English definitions",
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  term: { type: Type.STRING, description: "The legal/bureaucratic jargon term" },
-                  definition: { type: Type.STRING, description: "Simple plain-language definition" }
-                },
-                required: ["term", "definition"]
-              }
-            }
-          },
-          required: [
-            "isGovernmentRelated",
-            "documentType",
-            "trustScoreImpact",
-            "title",
-            "summary",
-            "simplifiedEnglish",
-            "teluguTranslation",
-            "hindiTranslation",
-            "glossary"
-          ]
-        }
-      }
+    console.log(`[Groq API] Sending request to llama-3.3-70b-versatile...`);
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: [{ role: "user", content: finalPrompt }],
+      response_format: { type: "json_object" }
     });
+    console.log(`[Groq API] Response received.`);
 
-    const outputText = modelResponse.text;
+    const outputText = completion.choices[0]?.message?.content;
     if (!outputText) {
       throw new Error("Empty response received from the simplification AI");
     }
@@ -532,19 +502,19 @@ Your return message MUST strictly fulfill the JSON structure outlined in the con
     // Save to persistent database
     const db = loadDb();
     const documentId = "doc_" + Math.random().toString(36).substring(2, 11);
-    
-    // Update that specific user's trust score within safe boundaries (10 to 100)
+
+    // +2 per successfully processed government document, clamped to [10, 100]
     const userData = getUserData(db, email);
-    const existingScore = userData.trustScore || 85;
-    const proposedScore = existingScore + (docuDetails.trustScoreImpact || 0);
-    const newScore = Math.max(10, Math.min(100, proposedScore));
+    const existingScore = userData.trustScore || 60;
+    const newScore = Math.max(10, Math.min(100, existingScore + 2));
     userData.trustScore = newScore;
 
     const newDocItem = {
       id: documentId,
-      originalText: text || `[Multimodal Document Upload: ${fileName || "document.bin"}]`,
+      originalText: text || `[Document Upload: ${fileName || "document.bin"}]`,
       timestamp: new Date().toISOString(),
-      ...docuDetails
+      ...docuDetails,
+      trustScoreImpact: 2, // after spread so it always wins; kept for frontend compatibility
     };
 
     userData.history.unshift(newDocItem);
@@ -557,10 +527,10 @@ Your return message MUST strictly fulfill the JSON structure outlined in the con
     });
 
   } catch (error: any) {
-    console.error("Gemini simplifier service failed:", error);
+    console.error("Groq simplifier service failed:", error);
     res.status(500).json({
-      error: error.message || "simplification service errored. Verify database or credentials.",
-      suggestion: "Make sure GEMINI_API_KEY is configured under Settings > Secrets."
+      error: error.message || "Simplification service errored. Verify database or credentials.",
+      suggestion: "Make sure GROQ_API_KEY is configured under Settings > Secrets."
     });
   }
 });
