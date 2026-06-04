@@ -6,7 +6,6 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 
@@ -145,7 +144,7 @@ function getGeminiClient(): GoogleGenAI {
 
 // Robust fallback wrapper with Exponential Backoff for 503 errors and Model fallbacks
 async function generateContentWithFallback(ai: GoogleGenAI, params: { contents: any; config: any }) {
-  const models = ["gemini-3.5-flash", "gemini-3.1-flash-lite"];
+  const models = ["gemini-2.0-flash", "gemini-1.5-flash"];
   let lastError: any = null;
 
   for (const modelName of models) {
@@ -289,8 +288,8 @@ app.post("/api/lookup-phone", (req, res) => {
   }
   
   // Find in local memory database
-  const email = Object.keys(db.users).find(e => {
-    const userPhone = db.users[e].phoneNumber || "";
+  const email = Object.keys(db.users!).find(e => {
+    const userPhone = db.users![e].phoneNumber || "";
     if (!userPhone) return false;
     
     const uDigits = userPhone.replace(/\D/g, "");
@@ -328,7 +327,7 @@ app.post("/api/login", (req, res) => {
   // If the user database document does not exist yet for this email, auto-initialize it safely
   if (!db.users[normEmail] || !db.users[normEmail].registered) {
     const computedName = normEmail.split("@")[0].split(/[._+-]/)
-      .map(p => p.charAt(0).toUpperCase() + p.slice(1))
+      .map((p: string) => p.charAt(0).toUpperCase() + p.slice(1))
       .join(" ") || "Citizen User";
       
     db.users[normEmail] = {
@@ -569,6 +568,7 @@ Your return message MUST strictly fulfill the JSON structure outlined in the con
 // Setup Vite & Static Files Hosting
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
