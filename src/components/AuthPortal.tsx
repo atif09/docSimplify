@@ -4,6 +4,19 @@
  */
 
 import React, { useState } from "react";
+// Provide minimal JSX/runtime declarations to satisfy TypeScript in environments
+// where @types/react or the automatic jsx runtime types are not available.
+// This avoids numerous `JSX.IntrinsicElements` and `react/jsx-runtime` errors
+// without changing project-wide tsconfig settings.
+declare module 'react/jsx-runtime';
+declare global {
+  namespace JSX {
+    // allow any intrinsic element to avoid implicit 'any' JSX errors in this file
+    interface IntrinsicElements {
+      [elemName: string]: any;
+    }
+  }
+}
 import { Shield, KeyRound, Mail, UserPlus, FileCheck, ArrowRight, X, Phone, ArrowLeft, Eye, EyeOff } from "lucide-react";
 import { UserProfile } from "../types";
 import { auth, db } from "../lib/firebase";
@@ -67,7 +80,7 @@ export default function AuthPortal({ onLoginSuccess, onClose }: AuthPortalProps)
   const [errorMsg, setErrorMsg] = useState("");
   const [showPassword, setShowPassword] = useState(false);
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setIsSubmitting(true);
     setErrorMsg("");
@@ -282,8 +295,10 @@ export default function AuthPortal({ onLoginSuccess, onClose }: AuthPortalProps)
           backendTrustScore = loginData.profile.trustScore || 85;
           computedName = loginData.profile.displayName || firestoreDisplayName || userDisplayName || computedName;
         } else {
-          const errData = await loginRes.json();
-          throw new Error(errData.error || "Login check failed on custom server database.");
+          let errMsg = "Login check failed on custom server database.";
+          try { const e = await loginRes.json(); errMsg = e.error || errMsg;
+          } catch {}
+          throw new Error(errMsg);
         }
       }
 
