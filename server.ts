@@ -144,7 +144,7 @@ function getGeminiClient(): GoogleGenAI {
 
 // Robust fallback wrapper with Exponential Backoff for 503 errors and Model fallbacks
 async function generateContentWithFallback(ai: GoogleGenAI, params: { contents: any; config: any }) {
-  const models = ["gemini-2.0-flash", "gemini-1.5-flash"];
+  const models = ["gemini-2.0-flash", "gemini-2.0-flash-lite"];
   let lastError: any = null;
 
   for (const modelName of models) {
