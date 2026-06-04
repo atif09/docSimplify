@@ -49,7 +49,7 @@ interface DbStructure {
 
 const DEFAULT_DB: DbStructure = {
   users: {},
-  trustScore: 60,
+  trustScore: 100,
   history: [],
   saved: [],
   userProfile: {
@@ -105,7 +105,7 @@ function getUserData(db: any, email: string): UserData {
   
   if (!db.users[normEmail]) {
     db.users[normEmail] = {
-      trustScore: 60,
+      trustScore: 100,
       history: [],
       saved: []
     };
@@ -268,7 +268,7 @@ app.post("/api/register", (req, res) => {
   }
   
   db.users[normEmail] = {
-    trustScore: 60,
+    trustScore: 100,
     history: [],
     saved: [],
     displayName: displayName || "John Doe",
@@ -282,7 +282,7 @@ app.post("/api/register", (req, res) => {
     profile: {
       email: normEmail,
       displayName: db.users[normEmail].displayName,
-      trustScore: 60,
+      trustScore: 100,
       isLoggedIn: true
     }
   });
@@ -346,7 +346,7 @@ app.post("/api/login", (req, res) => {
       .join(" ") || "Citizen User";
       
     db.users[normEmail] = {
-      trustScore: 60,
+      trustScore: 100,
       history: [],
       saved: [],
       displayName: computedName,
@@ -362,7 +362,7 @@ app.post("/api/login", (req, res) => {
     profile: {
       email: normEmail,
       displayName: userData.displayName || "John Doe",
-      trustScore: userData.trustScore || 85,
+      trustScore: userData.trustScore || 100,
       isLoggedIn: true
     }
   });
@@ -423,9 +423,9 @@ app.post("/api/history/clear", (req, res) => {
   const userData = getUserData(db, email);
   userData.history = [];
   userData.saved = [];
-  userData.trustScore = 60; // reset of trust score index
+  userData.trustScore = 100; // reset of trust score index
   saveDb(db);
-  res.json({ status: "success", history: [], saved: [], trustScore: 60 });
+  res.json({ status: "success", history: [], saved: [], trustScore: 100 });
 });
 
 // 4. Document processing (Manual Paste Text or PDF/Image Base64 extraction)
@@ -464,6 +464,7 @@ ${documentText}
 You are acting as an expert Government NLP Architect, Judiciary Translation Specialist, and Universal Citizen Advocate.
 Your mission is to perform these operations:
 1. Classification & Verification:
+   - First, determine whether the content is actually a document of any kind (letter, form, certificate, notice, image of text, etc.). Set "isDocument" to true if so. Set "isDocument" to false only if the content is clearly a random/personal photo, meme, or contains no document text whatsoever.
    - Detect whether the content is related to an official Indian government, legal matter, public utility, municipal sector, welfare program, state/central notification, judicial filing, or relevant public policy issue in India. Set "isGovernmentRelated" to true if so, otherwise false.
    - Categorize the exact "documentType", picking from or describing similar official genres: e.g., "Government Order", "Circular", "Welfare Scheme", "Tax & Customs Notice", "Judiciary Brief", "Public Notice", "Advisory", or "General Policy Brief".
 2. Simplification & Metadata Generation:
@@ -478,6 +479,7 @@ Your mission is to perform these operations:
 
 Return ONLY valid JSON with exactly these fields:
 {
+  "isDocument": boolean,
   "isGovernmentRelated": boolean,
   "documentType": string,
   "title": string,
@@ -506,21 +508,34 @@ Ensure Telugu and Hindi texts are fully translated and returned in elegant unico
 
     const docuDetails = JSON.parse(outputText);
 
-    // Explicit Verification: If the uploaded document is not government-related, halt and notify failure
-    if (docuDetails.isGovernmentRelated === false || !docuDetails.isGovernmentRelated) {
-      return res.status(400).json({
-        error: "Failed to translate because the uploaded document is not government-related"
-      });
-    }
-
     // Save to persistent database
     const db = loadDb();
     const documentId = "doc_" + Math.random().toString(36).substring(2, 11);
 
-    // +2 per successfully processed government document, clamped to [10, 100]
     const userData = getUserData(db, email);
-    const existingScore = userData.trustScore || 60;
-    const newScore = Math.max(10, Math.min(100, existingScore + 2));
+    const existingScore = userData.trustScore || 100;
+
+    // Non-government content — images get locked (no score change), PDFs/text get -10
+    if (docuDetails.isGovernmentRelated === false || !docuDetails.isGovernmentRelated) {
+      const isImage = mimeType && (mimeType as string).startsWith("image/");
+      if (isImage) {
+        return res.status(400).json({
+          error: "This image does not appear to be a government document. Please upload an official government document.",
+          locked: true,
+          trustScore: existingScore
+        });
+      }
+      const newScore = Math.max(10, Math.min(100, existingScore - 10));
+      userData.trustScore = newScore;
+      saveDb(db);
+      return res.status(400).json({
+        error: "Failed to translate because the uploaded document is not government-related",
+        trustScore: newScore
+      });
+    }
+
+    // Government document — +5, clamped to [10, 100]
+    const newScore = Math.max(10, Math.min(100, existingScore + 5));
     userData.trustScore = newScore;
 
     const newDocItem = {
@@ -528,7 +543,7 @@ Ensure Telugu and Hindi texts are fully translated and returned in elegant unico
       originalText: text || `[Document Upload: ${fileName || "document.bin"}]`,
       timestamp: new Date().toISOString(),
       ...docuDetails,
-      trustScoreImpact: 2, // after spread so it always wins; kept for frontend compatibility
+      trustScoreImpact: 5, // after spread so it always wins; kept for frontend compatibility
     };
 
     userData.history.unshift(newDocItem);
