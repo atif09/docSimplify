@@ -10,7 +10,7 @@ import Groq from "groq-sdk";
 import dotenv from "dotenv";
 
 // Load environment variables
-dotenv.config();
+dotenv.config({ path: new URL(".env", import.meta.url).pathname, override: true });
 
 const app = express();
 const PORT = 3000;
